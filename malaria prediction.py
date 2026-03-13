@@ -11,6 +11,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import warnings, joblib, os
+
+# Resolve all paths relative to this script (works locally + Streamlit Cloud)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 warnings.filterwarnings("ignore")
 
 from sklearn.preprocessing      import StandardScaler, LabelEncoder
@@ -46,7 +49,7 @@ def divider(title):
 # ================================================================
 divider("STEP 1  LOAD DATASET")
 
-df = pd.read_csv("Final_Malaria_Dataset.csv")
+df = pd.read_csv(os.path.join(BASE_DIR, "Final_Malaria_Dataset.csv"))
 vc = df["High_Risk_Binary"].value_counts()
 print(f"  Rows x Cols   : {df.shape}")
 print(f"  Regions       : {sorted(df['Region'].unique())}")
@@ -215,15 +218,15 @@ print(classification_report(y_test, results[best_name]["y_pred"],
 # ================================================================
 divider("STEP 8  DEPLOY - SAVE ARTIFACTS")
 
-joblib.dump(best_model, "malaria_model.pkl")
-joblib.dump(scaler,     "malaria_scaler.pkl")
-joblib.dump(le_region,  "malaria_le_region.pkl")
-joblib.dump(le_county,  "malaria_le_county.pkl")
-pd.Series(sel_feats, name="feature").to_csv("malaria_features.csv", index=False)
+joblib.dump(best_model, os.path.join(BASE_DIR, "malaria_model.pkl"))
+joblib.dump(scaler,     os.path.join(BASE_DIR, "malaria_scaler.pkl"))
+joblib.dump(le_region,  os.path.join(BASE_DIR, "malaria_le_region.pkl"))
+joblib.dump(le_county,  os.path.join(BASE_DIR, "malaria_le_county.pkl"))
+pd.Series(sel_feats, name="feature").to_csv(os.path.join(BASE_DIR, "malaria_features.csv"), index=False)
 
 for f in ["malaria_model.pkl","malaria_scaler.pkl",
           "malaria_le_region.pkl","malaria_le_county.pkl","malaria_features.csv"]:
-    print(f"  Saved: {f:<40} ({os.path.getsize(f)/1024:.1f} KB)")
+    print(f"  Saved: {f:<40} ({os.path.getsize(os.path.join(BASE_DIR, f))/1024:.1f} KB)")
 
 
 def predict_risk(input_dict: dict) -> dict:
@@ -256,9 +259,9 @@ def predict_risk(input_dict: dict) -> dict:
     ...     "Rain_x_Temp": 4320.0,
     ... })
     """
-    _model  = joblib.load("malaria_model.pkl")
-    _scaler = joblib.load("malaria_scaler.pkl")
-    _feats  = pd.read_csv("malaria_features.csv").squeeze().tolist()
+    _model  = joblib.load(os.path.join(BASE_DIR, "malaria_model.pkl"))
+    _scaler = joblib.load(os.path.join(BASE_DIR, "malaria_scaler.pkl"))
+    _feats  = pd.read_csv(os.path.join(BASE_DIR, "malaria_features.csv")).squeeze().tolist()
     row     = pd.DataFrame([input_dict])[_feats]
     row_sc  = _scaler.transform(row)
     pred    = _model.predict(row_sc)[0]
