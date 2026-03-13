@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import warnings, joblib, os
+import warnings, joblib, os, io
 
 # Resolve all paths relative to this script (works locally + Streamlit Cloud)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,9 +47,25 @@ def divider(title):
 # ================================================================
 # STEP 1 — LOAD DATASET
 # ================================================================
-divider("STEP 1  LOAD DATASET")
+import streamlit as st
 
-df = pd.read_csv(os.path.join(BASE_DIR, "Final_Malaria_Dataset.csv"))
+st.title("🦟 Malaria High-Risk Predictor — ML Pipeline")
+st.markdown("Upload your dataset CSV file to run the full training pipeline.")
+
+uploaded_file = st.file_uploader(
+    "📂 Upload Final_Malaria_Dataset.csv",
+    type=["csv"],
+    help="Upload the malaria dataset CSV file to begin"
+)
+
+if uploaded_file is None:
+    st.info("👆 Please upload the CSV file above to start the pipeline.")
+    st.stop()
+
+df = pd.read_csv(uploaded_file)
+st.success(f"✅ Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+
+divider("STEP 1  LOAD DATASET")
 vc = df["High_Risk_Binary"].value_counts()
 print(f"  Rows x Cols   : {df.shape}")
 print(f"  Regions       : {sorted(df['Region'].unique())}")
