@@ -1,441 +1,513 @@
 # ================================================================
-#  MALARIA HIGH-RISK PREDICTOR — Complete ML Pipeline
+#  MALARIA HIGH-RISK PREDICTOR — Full Streamlit ML App
 #  Target : High_Risk_Binary  (1 = High Risk | 0 = Low Risk)
-#  Data   : Kenya regions — 1500 records (2022–2026)
 # ================================================================
 
+import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import warnings, joblib, os, io
-
-# Resolve all paths relative to this script (works locally + Streamlit Cloud)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+import warnings, joblib, io
 warnings.filterwarnings("ignore")
 
-from sklearn.preprocessing      import StandardScaler, LabelEncoder
-from sklearn.model_selection    import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.feature_selection  import SelectKBest, f_classif
-from sklearn.linear_model       import LogisticRegression
-from sklearn.ensemble           import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm                import SVC
-from sklearn.metrics            import (accuracy_score, f1_score, precision_score,
-                                        recall_score, roc_auc_score, roc_curve,
-                                        confusion_matrix, classification_report)
+from sklearn.preprocessing     import StandardScaler, LabelEncoder
+from sklearn.model_selection   import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model      import LogisticRegression
+from sklearn.ensemble          import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm               import SVC
+from sklearn.metrics           import (accuracy_score, f1_score, precision_score,
+                                       recall_score, roc_auc_score, roc_curve,
+                                       confusion_matrix, classification_report)
 
-PAL   = ["#00d4ff", "#a78bfa", "#fb7185", "#34d399", "#fbbf24"]
-BG    = "#0f1523"
-GRID  = "#1e2d45"
-TEXT  = "#cbd5e1"
-BLACK = "#080c14"
+PAL  = ["#00d4ff", "#a78bfa", "#fb7185", "#34d399", "#fbbf24"]
+BG   = "#0d1726"
+GRID = "#1e2d45"
+TEXT = "#cbd5e1"
 
-def _ax(ax, title=""):
+def apply_dark(ax):
     ax.set_facecolor(BG)
     ax.tick_params(colors=TEXT, labelsize=8)
-    for sp in ax.spines.values(): sp.set_color(GRID)
-    if title: ax.set_title(title, color=TEXT, fontsize=10, fontweight="bold", pad=8)
-    return ax
+    ax.xaxis.label.set_color(TEXT)
+    ax.yaxis.label.set_color(TEXT)
+    ax.title.set_color(TEXT)
+    for sp in ax.spines.values():
+        sp.set_color(GRID)
 
-def divider(title):
-    print(f"\n{'='*65}")
-    print(f"  {title}")
-    print(f"{'='*65}")
-
-# ================================================================
-# STEP 1 — LOAD DATASET
-# ================================================================
-import streamlit as st
-
-st.title("🦟 Malaria High-Risk Predictor — ML Pipeline")
-st.markdown("Upload your dataset CSV file to run the full training pipeline.")
-
-uploaded_file = st.file_uploader(
-    "📂 Upload Final_Malaria_Dataset.csv",
-    type=["csv"],
-    help="Upload the malaria dataset CSV file to begin"
+# ── Page config ───────────────────────────────────────────────
+st.set_page_config(
+    page_title="Malaria Risk Predictor",
+    page_icon="🦟",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
+html, body, [class*="css"] { font-family:'Syne',sans-serif; background-color:#080c14; color:#e2e8f0; }
+[data-testid="stSidebar"] { background:#0d1220 !important; border-right:1px solid #1e2d45; }
+[data-testid="stSidebar"] * { color:#cbd5e1 !important; }
+div[data-testid="metric-container"] { background:#0d1726; border:1px solid #1e3a5f; border-radius:12px; padding:16px 20px; }
+div[data-testid="metric-container"] label { color:#64748b !important; font-size:12px; letter-spacing:0.1em; text-transform:uppercase; }
+div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color:#38bdf8 !important; font-family:'Space Mono',monospace; font-size:1.5rem !important; }
+.stTabs [data-baseweb="tab-list"] { background:#0d1220; border-bottom:1px solid #1e2d45; }
+.stTabs [data-baseweb="tab"] { background:transparent; color:#475569; border:none; font-weight:600; padding:10px 22px; }
+.stTabs [aria-selected="true"] { background:#0f2744 !important; color:#38bdf8 !important; border-bottom:2px solid #38bdf8 !important; }
+.stButton > button { background:linear-gradient(135deg,#0ea5e9,#6366f1); color:white; border:none; border-radius:8px; font-family:'Space Mono',monospace; font-size:13px; padding:10px 28px; width:100%; transition:opacity 0.2s; }
+.stButton > button:hover { opacity:0.85; }
+h1 { font-family:'Syne',sans-serif !important; font-weight:800 !important; color:#f0f9ff !important; }
+h2,h3 { font-family:'Syne',sans-serif !important; font-weight:600 !important; color:#cbd5e1 !important; }
+.stSuccess { background:#042f2e !important; border-left:4px solid #10b981 !important; }
+.stInfo    { background:#0c1a2e !important; border-left:4px solid #38bdf8 !important; }
+.stError   { background:#2d0a0a !important; border-left:4px solid #fb7185 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Sidebar ───────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🦟 Malaria Predictor")
+    st.markdown("---")
+    uploaded_file = st.file_uploader("📂 Upload Dataset (CSV)", type=["csv"])
+    st.markdown("---")
+    st.markdown("**⚙️ Pipeline Settings**")
+    test_size = st.slider("Test Split %", 10, 40, 20)
+    top_k     = st.slider("Features to Select (K)", 5, 16, 12)
+    st.markdown("---")
+    run_btn = st.button("🚀 Run Full Pipeline")
+    st.markdown("---")
+    st.markdown("""<small style='color:#334155'>
+<b>Pipeline Steps</b><br>
+① Load Dataset<br>② Data Cleaning<br>③ Feature Engineering<br>
+④ Feature Selection<br>⑤ Train/Test Split<br>⑥ Train 4 Models<br>
+⑦ Evaluate & Compare<br>⑧ Deploy & Predict</small>""", unsafe_allow_html=True)
+
+# ── Header ────────────────────────────────────────────────────
+st.markdown("""
+<div style='padding:28px 0 8px 0'>
+  <span style='font-family:Space Mono,monospace;font-size:11px;color:#38bdf8;letter-spacing:0.2em'>MACHINE LEARNING PIPELINE</span>
+  <h1 style='margin:4px 0 0 0;font-size:2.4rem'>🦟 Malaria High-Risk Predictor</h1>
+  <p style='color:#475569;margin-top:6px'>Upload your dataset · Clean · Engineer · Train · Predict</p>
+</div>
+<hr style='border-color:#1e2d45;margin-bottom:24px'>
+""", unsafe_allow_html=True)
+
 if uploaded_file is None:
-    st.info("👆 Please upload the CSV file above to start the pipeline.")
+    st.info("👈 Upload your CSV dataset in the sidebar to get started.")
+    st.markdown("""
+**Expected CSV columns:**
+```
+Region, County, Year, Month, Population, Rainfall_mm, Temperature_C,
+Humidity_percent, Malaria_Cases, Lag_1_Month_Cases, Incidence_per_100k, High_Risk_Binary
+```
+""")
     st.stop()
 
-df = pd.read_csv(uploaded_file)
-st.success(f"✅ Dataset loaded: {df.shape[0]} rows × {df.shape[1]} columns")
+df_raw = pd.read_csv(uploaded_file)
 
-divider("STEP 1  LOAD DATASET")
-vc = df["High_Risk_Binary"].value_counts()
-print(f"  Rows x Cols   : {df.shape}")
-print(f"  Regions       : {sorted(df['Region'].unique())}")
-print(f"  Counties      : {df['County'].nunique()} unique")
-print(f"  Year range    : {df['Year'].min()} - {df['Year'].max()}")
-print(f"  Low  Risk (0) : {vc[0]}  ({vc[0]/len(df)*100:.1f}%)")
-print(f"  High Risk (1) : {vc[1]}  ({vc[1]/len(df)*100:.1f}%)")
+# ── Tabs ──────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Data Explorer", "🧠 Model Training", "📈 Evaluation", "🔮 Predict", "💾 Export"
+])
 
 # ================================================================
-# STEP 2 — DATA CLEANING
+# TAB 1 — DATA EXPLORER
 # ================================================================
-divider("STEP 2  DATA CLEANING")
+with tab1:
+    st.markdown("### Step 1 · Raw Dataset")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Rows",     df_raw.shape[0])
+    c2.metric("Columns",        df_raw.shape[1])
+    c3.metric("Missing Values", int(df_raw.isnull().sum().sum()))
+    c4.metric("Duplicate Rows", int(df_raw.duplicated().sum()))
 
-miss_before = df.isnull().sum()
-print("  Missing values per column (before):")
-for col, n in miss_before[miss_before > 0].items():
-    print(f"    {col:<22}: {n:>4}  ({n/len(df)*100:.0f}%)")
+    with st.expander("🔍 Preview Data", expanded=True):
+        st.dataframe(df_raw.head(20), use_container_width=True)
 
-# Drop columns with >= 40% missing  (ID, Health_Facilities, Avg_Income, Disease_Cases, Notes)
-drop_cols = [c for c in df.columns if df[c].isnull().mean() >= 0.40]
-df.drop(columns=drop_cols, inplace=True)
-print(f"\n  Dropped columns (>=40% null) : {drop_cols}")
+    if "High_Risk_Binary" in df_raw.columns:
+        vc = df_raw["High_Risk_Binary"].value_counts()
+        st.markdown("### Target Distribution")
+        col_a, col_b = st.columns(2)
+        col_a.metric("🟢 Low Risk  (0)", f"{vc.get(0,0)} rows ({vc.get(0,0)/len(df_raw)*100:.1f}%)")
+        col_b.metric("🔴 High Risk (1)", f"{vc.get(1,0)} rows ({vc.get(1,0)/len(df_raw)*100:.1f}%)")
 
-# Remove duplicate rows
-n_dup = df.duplicated().sum()
-df.drop_duplicates(inplace=True)
-print(f"  Duplicate rows removed       : {n_dup}")
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4), facecolor="#080c14")
+        ax = axes[0]; apply_dark(ax)
+        ax.bar(["Low Risk (0)","High Risk (1)"], [vc.get(0,0),vc.get(1,0)],
+               color=["#34d399","#fb7185"], edgecolor=GRID, width=0.5)
+        ax.set_title("Class Count", color=TEXT, fontsize=11, fontweight="bold")
+        ax.set_ylabel("Count", color=TEXT)
+        for i, v in enumerate([vc.get(0,0), vc.get(1,0)]):
+            ax.text(i, v+5, str(v), ha="center", color=TEXT, fontweight="bold")
+        ax2 = axes[1]; apply_dark(ax2)
+        if "Incidence_per_100k" in df_raw.columns:
+            low_i  = df_raw[df_raw["High_Risk_Binary"]==0]["Incidence_per_100k"].dropna()
+            high_i = df_raw[df_raw["High_Risk_Binary"]==1]["Incidence_per_100k"].dropna()
+            ax2.hist(low_i,  bins=40, color="#34d399", alpha=0.7, label="Low Risk",  edgecolor=GRID)
+            ax2.hist(high_i, bins=40, color="#fb7185", alpha=0.7, label="High Risk", edgecolor=GRID)
+            ax2.set_title("Incidence per 100k", color=TEXT, fontsize=11, fontweight="bold")
+            ax2.set_xlabel("Incidence per 100k"); ax2.legend(labelcolor=TEXT, facecolor=BG, fontsize=9)
+        st.pyplot(fig, use_container_width=True); plt.close()
 
-# Impute any residual nulls
-for col in df.select_dtypes(include="number").columns:
-    if df[col].isnull().any():
-        df[col].fillna(df[col].median(), inplace=True)
-for col in df.select_dtypes(include="object").columns:
-    if df[col].isnull().any():
-        df[col].fillna(df[col].mode()[0], inplace=True)
-
-print(f"  Remaining nulls              : {df.isnull().sum().sum()}")
-print(f"  Shape after cleaning         : {df.shape}")
-
-# ================================================================
-# STEP 3 — FEATURE ENGINEERING & SELECTION
-# ================================================================
-divider("STEP 3  FEATURE ENGINEERING & SELECTION")
-
-# Encode categoricals
-le_region = LabelEncoder()
-le_county = LabelEncoder()
-df["Region_enc"] = le_region.fit_transform(df["Region"])
-df["County_enc"] = le_county.fit_transform(df["County"])
-
-# Seasonal buckets (Kenya: long rains Mar-May, short rains Oct-Dec)
-df["Season"] = df["Month"].map(
-    {1:0,2:0,3:1,4:1,5:1,6:2,7:2,8:2,9:2,10:3,11:3,12:3})
-
-# Derived numeric features
-df["Cases_per_Pop"]   = df["Malaria_Cases"] / df["Population"] * 1e5
-df["Lag_Change"]      = df["Malaria_Cases"] - df["Lag_1_Month_Cases"]
-df["Lag_Ratio"]       = (df["Malaria_Cases"] /
-                          df["Lag_1_Month_Cases"].replace(0, np.nan)).fillna(1)
-df["Rain_x_Humidity"] = df["Rainfall_mm"]   * df["Humidity_percent"]
-df["Temp_x_Humidity"] = df["Temperature_C"] * df["Humidity_percent"]
-df["Rain_x_Temp"]     = df["Rainfall_mm"]   * df["Temperature_C"]
-
-new_feats = ["Season","Cases_per_Pop","Lag_Change","Lag_Ratio",
-             "Rain_x_Humidity","Temp_x_Humidity","Rain_x_Temp"]
-print(f"  New features created : {new_feats}")
-
-TARGET    = "High_Risk_Binary"
-EXCLUDE   = ["Region", "County", TARGET]
-feat_cols = [c for c in df.columns if c not in EXCLUDE]
-X = df[feat_cols]
-y = df[TARGET]
-print(f"\n  Total candidate features : {len(feat_cols)}")
-
-# SelectKBest (ANOVA F-score)
-K        = 12
-selector = SelectKBest(f_classif, k=K)
-selector.fit(X, y)
-f_scores = pd.Series(selector.scores_, index=feat_cols).sort_values(ascending=False)
-sel_feats = f_scores.head(K).index.tolist()
-X_sel     = X[sel_feats]
-
-print(f"\n  Top {K} features by ANOVA F-score:")
-for feat, score in f_scores.head(K).items():
-    print(f"    * {feat:<28}  F = {score:>10.2f}")
+    st.markdown("### Missing Values per Column")
+    miss = df_raw.isnull().sum()
+    miss_df = pd.DataFrame({"Column":miss.index,"Missing":miss.values,"% Missing":(miss.values/len(df_raw)*100).round(1)})
+    st.dataframe(miss_df[miss_df["Missing"]>0], use_container_width=True, hide_index=True)
+    st.markdown("### Descriptive Statistics")
+    st.dataframe(df_raw.describe().round(3), use_container_width=True)
 
 # ================================================================
-# STEP 4 — TRAIN / TEST SPLIT
+# TAB 2 — MODEL TRAINING
 # ================================================================
-divider("STEP 4  TRAIN / TEST SPLIT  (80/20 stratified)")
+with tab2:
+    if not run_btn and "results" not in st.session_state:
+        st.info("⬅️ Configure settings in the sidebar and click **🚀 Run Full Pipeline**.")
+        st.stop()
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X_sel, y, test_size=0.20, random_state=42, stratify=y)
+    if run_btn:
+        with st.status("⚙️ Running Full ML Pipeline…", expanded=True) as status:
+            # STEP 2: Clean
+            st.write("🧹 Step 2 · Cleaning data…")
+            df = df_raw.copy()
+            drop_cols = [c for c in df.columns if df[c].isnull().mean() >= 0.40]
+            df.drop(columns=drop_cols, inplace=True)
+            n_dup = df.duplicated().sum()
+            df.drop_duplicates(inplace=True)
+            for col in df.select_dtypes(include="number").columns:
+                if df[col].isnull().any(): df[col].fillna(df[col].median(), inplace=True)
+            for col in df.select_dtypes(include="object").columns:
+                if df[col].isnull().any(): df[col].fillna(df[col].mode()[0], inplace=True)
+            st.write(f"   Dropped {len(drop_cols)} high-null columns, {n_dup} duplicate rows removed")
 
-scaler     = StandardScaler()
-X_train_sc = scaler.fit_transform(X_train)
-X_test_sc  = scaler.transform(X_test)
+            # STEP 3: Feature engineering
+            st.write("⚙️ Step 3 · Engineering features…")
+            le_region = LabelEncoder(); le_county = LabelEncoder()
+            df["Region_enc"]   = le_region.fit_transform(df["Region"])
+            df["County_enc"]   = le_county.fit_transform(df["County"])
+            df["Season"]       = df["Month"].map({1:0,2:0,3:1,4:1,5:1,6:2,7:2,8:2,9:2,10:3,11:3,12:3})
+            df["Cases_per_Pop"]   = df["Malaria_Cases"] / df["Population"] * 1e5
+            df["Lag_Change"]      = df["Malaria_Cases"] - df["Lag_1_Month_Cases"]
+            df["Lag_Ratio"]       = (df["Malaria_Cases"] / df["Lag_1_Month_Cases"].replace(0, np.nan)).fillna(1)
+            df["Rain_x_Humidity"] = df["Rainfall_mm"]   * df["Humidity_percent"]
+            df["Temp_x_Humidity"] = df["Temperature_C"] * df["Humidity_percent"]
+            df["Rain_x_Temp"]     = df["Rainfall_mm"]   * df["Temperature_C"]
+            st.write("   Created 7 new interaction + seasonal features")
 
-print(f"  Training : {len(X_train):>5}  (High={y_train.sum()} | Low={(y_train==0).sum()})")
-print(f"  Testing  : {len(X_test):>5}  (High={y_test.sum()} | Low={(y_test==0).sum()})")
+            # STEP 4: Feature selection
+            st.write(f"✅ Step 4 · Selecting top {top_k} features…")
+            TARGET    = "High_Risk_Binary"
+            feat_cols = [c for c in df.columns if c not in ["Region","County",TARGET]]
+            X = df[feat_cols]; y = df[TARGET]
+            selector  = SelectKBest(f_classif, k=min(top_k, len(feat_cols)))
+            selector.fit(X, y)
+            f_scores  = pd.Series(selector.scores_, index=feat_cols).sort_values(ascending=False)
+            sel_feats = f_scores.head(top_k).index.tolist()
+            X_sel     = X[sel_feats]
+
+            # STEP 5: Split
+            st.write(f"✂️ Step 5 · Splitting {100-test_size}/{test_size}…")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_sel, y, test_size=test_size/100, random_state=42, stratify=y)
+            scaler     = StandardScaler()
+            X_train_sc = scaler.fit_transform(X_train)
+            X_test_sc  = scaler.transform(X_test)
+
+            # STEP 6: Train
+            st.write("🤖 Step 6 · Training 4 models…")
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            MODELS = {
+                "Logistic Regression": LogisticRegression(C=1.0, max_iter=1000, random_state=42),
+                "Random Forest":       RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42),
+                "Gradient Boosting":   GradientBoostingClassifier(n_estimators=150, learning_rate=0.05, max_depth=5, random_state=42),
+                "SVM (RBF)":           SVC(C=1.0, kernel="rbf", probability=True, random_state=42),
+            }
+            results = {}
+            for name, model in MODELS.items():
+                model.fit(X_train_sc, y_train)
+                cv = cross_val_score(model, X_train_sc, y_train, cv=skf, scoring="roc_auc")
+                results[name] = dict(model=model, cv_mean=cv.mean(), cv_std=cv.std())
+                st.write(f"   ✓ {name}  —  CV AUC: {cv.mean():.4f}")
+
+            # STEP 7: Evaluate
+            st.write("📊 Step 7 · Evaluating on test set…")
+            for name, info in results.items():
+                m = info["model"]
+                y_pred = m.predict(X_test_sc)
+                y_proba = m.predict_proba(X_test_sc)[:,1]
+                info.update(dict(
+                    y_pred=y_pred, y_proba=y_proba,
+                    acc=accuracy_score(y_test,y_pred),
+                    auc=roc_auc_score(y_test,y_proba),
+                    f1=f1_score(y_test,y_pred),
+                    prec=precision_score(y_test,y_pred),
+                    rec=recall_score(y_test,y_pred),
+                    cm=confusion_matrix(y_test,y_pred),
+                    report=classification_report(y_test,y_pred,target_names=["Low Risk","High Risk"],output_dict=True),
+                ))
+
+            best_name  = max(results, key=lambda k: results[k]["auc"])
+            best_model = results[best_name]["model"]
+            buf_model  = io.BytesIO(); joblib.dump(best_model, buf_model); buf_model.seek(0)
+            buf_scaler = io.BytesIO(); joblib.dump(scaler,     buf_scaler); buf_scaler.seek(0)
+
+            st.session_state.update(dict(
+                results=results, best_name=best_name, best_model=best_model,
+                scaler=scaler, sel_feats=sel_feats, f_scores=f_scores,
+                X_sel=X_sel, X_test=X_test, y_test=y_test, y_train=y_train,
+                df=df, drop_cols=drop_cols, n_dup=n_dup,
+                buf_model=buf_model, buf_scaler=buf_scaler, top_k=top_k,
+            ))
+            status.update(label="✅ Pipeline complete!", state="complete")
+
+    if "results" not in st.session_state:
+        st.stop()
+
+    results   = st.session_state.results
+    best_name = st.session_state.best_name
+    sel_feats = st.session_state.sel_feats
+    f_scores  = st.session_state.f_scores
+    top_k     = st.session_state.top_k
+    y_train   = st.session_state.y_train
+    y_test    = st.session_state.y_test
+
+    st.markdown("### ✅ Step 2 · Data Cleaning")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Columns Dropped",   len(st.session_state.drop_cols))
+    c2.metric("Duplicates Removed", st.session_state.n_dup)
+    c3.metric("Remaining Nulls",   0)
+    if st.session_state.drop_cols:
+        st.caption(f"Dropped: `{'`, `'.join(st.session_state.drop_cols)}`")
+
+    st.markdown("### ✅ Step 3 & 4 · Feature Engineering & Selection")
+    col_l, col_r = st.columns(2)
+    with col_l:
+        feat_df = pd.DataFrame({"Feature":f_scores.head(top_k).index,"F-Score":f_scores.head(top_k).values.round(2)})
+        st.dataframe(feat_df, use_container_width=True, hide_index=True)
+    with col_r:
+        fig, ax = plt.subplots(figsize=(6, 4), facecolor="#080c14"); apply_dark(ax)
+        fs = f_scores.head(top_k).sort_values()
+        ax.barh(fs.index, fs.values, color=[PAL[i%len(PAL)] for i in range(len(fs))], edgecolor=GRID, height=0.65)
+        ax.set_xlabel("F-Score"); ax.set_title("ANOVA F-Scores", color=TEXT, fontsize=11, fontweight="bold")
+        st.pyplot(fig, use_container_width=True); plt.close()
+
+    st.markdown("### ✅ Step 5 · Train / Test Split")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Train Samples",   len(y_train))
+    c2.metric("Test Samples",    len(y_test))
+    c3.metric("Train High Risk", int(y_train.sum()))
+    c4.metric("Test High Risk",  int(y_test.sum()))
+
+    st.markdown("### ✅ Step 6 · Cross-Validation AUC")
+    cv_df = pd.DataFrame([{
+        "Model":       n,
+        "CV AUC Mean": f"{i['cv_mean']:.4f}",
+        "CV AUC Std":  f"±{i['cv_std']:.4f}",
+        "Best?":       "🏆" if n == best_name else ""
+    } for n, i in results.items()])
+    st.dataframe(cv_df, use_container_width=True, hide_index=True)
 
 # ================================================================
-# STEP 5 & 6 — CHOOSE & TRAIN MODELS
+# TAB 3 — EVALUATION
 # ================================================================
-divider("STEP 5 & 6  CHOOSE ALGORITHMS & TRAIN")
+with tab3:
+    if "results" not in st.session_state:
+        st.info("⬅️ Run the pipeline first."); st.stop()
 
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    results   = st.session_state.results
+    best_name = st.session_state.best_name
+    y_test    = st.session_state.y_test
+    short     = ["LR","RF","GBM","SVM"]
 
-MODELS = {
-    "Logistic Regression" : LogisticRegression(C=1.0, max_iter=1000, random_state=42),
-    "Random Forest"       : RandomForestClassifier(n_estimators=300, max_depth=12,
-                                                    min_samples_leaf=2, random_state=42),
-    "Gradient Boosting"   : GradientBoostingClassifier(n_estimators=200, learning_rate=0.05,
-                                                        max_depth=5, subsample=0.8,
-                                                        random_state=42),
-    "SVM (RBF)"           : SVC(C=1.0, kernel="rbf", probability=True, random_state=42),
-}
+    st.markdown("### Step 7 · Test Set Results")
+    summary = pd.DataFrame([{
+        "Model":     n,
+        "Accuracy":  f"{i['acc']:.4f}",
+        "AUC-ROC":   f"{i['auc']:.4f}",
+        "F1 Score":  f"{i['f1']:.4f}",
+        "Precision": f"{i['prec']:.4f}",
+        "Recall":    f"{i['rec']:.4f}",
+        "Best?":     "🏆" if n == best_name else ""
+    } for n, i in results.items()])
+    st.dataframe(summary, use_container_width=True, hide_index=True)
 
-results = {}
-print(f"\n  {'Model':<25}  CV-AUC (mean)   CV-AUC (std)")
-print(f"  {'-'*55}")
-for name, model in MODELS.items():
-    model.fit(X_train_sc, y_train)
-    cv = cross_val_score(model, X_train_sc, y_train, cv=skf, scoring="roc_auc")
-    results[name] = dict(model=model, cv_mean=cv.mean(), cv_std=cv.std())
-    print(f"  {name:<25}  {cv.mean():.4f}          {cv.std():.4f}")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**ROC Curves**")
+        fig, ax = plt.subplots(figsize=(6, 4.5), facecolor="#080c14"); apply_dark(ax)
+        for i, (name, info) in enumerate(results.items()):
+            fpr, tpr, _ = roc_curve(y_test, info["y_proba"])
+            ax.plot(fpr, tpr, color=PAL[i], lw=2, label=f"{short[i]}  AUC={info['auc']:.3f}")
+        ax.plot([0,1],[0,1],"--",color=GRID,lw=1)
+        ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+        ax.set_title("ROC Curves", color=TEXT, fontsize=12, fontweight="bold")
+        ax.legend(labelcolor=TEXT, facecolor=BG, fontsize=9, framealpha=0.4)
+        st.pyplot(fig, use_container_width=True); plt.close()
+
+    with col_b:
+        st.markdown(f"**Confusion Matrix — {best_name}**")
+        fig, ax = plt.subplots(figsize=(5, 4), facecolor="#080c14"); apply_dark(ax)
+        cm = results[best_name]["cm"]
+        ax.imshow(cm, cmap="Blues", aspect="auto")
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, str(cm[i,j]), ha="center", va="center", color="white", fontsize=20, fontweight="bold")
+        ax.set_xticks([0,1]); ax.set_yticks([0,1])
+        ax.set_xticklabels(["Low Risk","High Risk"], color=TEXT)
+        ax.set_yticklabels(["Low Risk","High Risk"], color=TEXT)
+        ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+        ax.set_title(f"Confusion Matrix ({best_name})", color=TEXT, fontsize=11, fontweight="bold")
+        st.pyplot(fig, use_container_width=True); plt.close()
+
+    st.markdown("**All Metrics Comparison**")
+    fig, ax = plt.subplots(figsize=(12, 4), facecolor="#080c14"); apply_dark(ax)
+    mets = ["acc","auc","f1","prec","rec"]; xlbls = ["Accuracy","AUC","F1","Precision","Recall"]
+    x, w = np.arange(len(mets)), 0.18
+    for i, (name, info) in enumerate(results.items()):
+        ax.bar(x+i*w, [info[m] for m in mets], w, label=short[i], color=PAL[i], edgecolor=GRID, alpha=0.88)
+    ax.set_xticks(x+w*1.5); ax.set_xticklabels(xlbls, color=TEXT, fontsize=10)
+    ax.set_ylim(0, 1.15)
+    ax.legend(labelcolor=TEXT, facecolor=BG, fontsize=9, framealpha=0.4)
+    ax.set_title("Test Metrics — All Models", color=TEXT, fontsize=12, fontweight="bold")
+    st.pyplot(fig, use_container_width=True); plt.close()
+
+    st.markdown("**Detailed Classification Reports**")
+    tabs_models = st.tabs(list(results.keys()))
+    for i, (name, info) in enumerate(results.items()):
+        with tabs_models[i]:
+            st.dataframe(pd.DataFrame(info["report"]).T.round(3), use_container_width=True)
+
+    st.markdown("**Monthly Average Cases Trend**")
+    df_sess = st.session_state.df
+    fig, ax = plt.subplots(figsize=(12, 3.5), facecolor="#080c14"); apply_dark(ax)
+    mo = df_sess.groupby("Month")["Malaria_Cases"].mean()
+    ax.fill_between(mo.index, mo.values, alpha=0.15, color=PAL[0])
+    ax.plot(mo.index, mo.values, color=PAL[0], lw=2.5, marker="o", markersize=6)
+    ax.set_xlabel("Month"); ax.set_ylabel("Avg Cases")
+    ax.set_xticks(range(1,13))
+    ax.set_xticklabels(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], color=TEXT, fontsize=9)
+    ax.set_title("Monthly Average Malaria Cases", color=TEXT, fontsize=12, fontweight="bold")
+    for start, end in [(3,6),(10,13)]:
+        ax.axvspan(start, min(end,12.5), alpha=0.07, color="#34d399")
+    st.pyplot(fig, use_container_width=True); plt.close()
 
 # ================================================================
-# STEP 7 — EVALUATE
+# TAB 4 — PREDICT
 # ================================================================
-divider("STEP 7  EVALUATE ON HELD-OUT TEST SET")
+with tab4:
+    if "results" not in st.session_state:
+        st.info("⬅️ Run the pipeline first."); st.stop()
 
-for name, info in results.items():
-    m       = info["model"]
-    y_pred  = m.predict(X_test_sc)
-    y_proba = m.predict_proba(X_test_sc)[:, 1]
-    info.update(dict(
-        y_pred  = y_pred, y_proba = y_proba,
-        acc     = accuracy_score(y_test, y_pred),
-        auc     = roc_auc_score(y_test, y_proba),
-        f1      = f1_score(y_test, y_pred),
-        prec    = precision_score(y_test, y_pred),
-        rec     = recall_score(y_test, y_pred),
-        cm      = confusion_matrix(y_test, y_pred),
-        report  = classification_report(y_test, y_pred,
-                      target_names=["Low Risk","High Risk"], output_dict=True),
-    ))
+    best_model = st.session_state.best_model
+    scaler     = st.session_state.scaler
+    sel_feats  = st.session_state.sel_feats
+    X_sel      = st.session_state.X_sel
+    best_name  = st.session_state.best_name
+    X_test     = st.session_state.X_test
+    y_test     = st.session_state.y_test
 
-print(f"\n  {'Model':<25}  Accuracy    AUC       F1      Precision   Recall")
-print(f"  {'-'*72}")
-for name, info in results.items():
-    print(f"  {name:<25}  {info['acc']:.4f}    {info['auc']:.4f}    "
-          f"{info['f1']:.4f}    {info['prec']:.4f}    {info['rec']:.4f}")
+    st.markdown(f"### Step 8 · Predict with **{best_name}**")
+    st.markdown("Adjust the values below and click **Predict**.")
 
-best_name  = max(results, key=lambda k: results[k]["auc"])
-best_model = results[best_name]["model"]
-print(f"\n  BEST MODEL : {best_name}")
-print(f"  AUC={results[best_name]['auc']:.4f}  F1={results[best_name]['f1']:.4f}  "
-      f"Accuracy={results[best_name]['acc']:.4f}")
-print(f"\n  Detailed Report - {best_name}:")
-print(classification_report(y_test, results[best_name]["y_pred"],
-                             target_names=["Low Risk","High Risk"]))
+    last_row = X_sel.iloc[-1]
+    inputs   = {}
+    n_cols   = 3
+    rows_    = [st.columns(n_cols) for _ in range((len(sel_feats)+n_cols-1)//n_cols)]
+    for i, feat in enumerate(sel_feats):
+        col  = rows_[i//n_cols][i%n_cols]
+        mn   = float(X_sel[feat].min())
+        mx   = float(X_sel[feat].max())
+        step = max((mx-mn)/200, 0.001)
+        inputs[feat] = col.number_input(feat, value=float(last_row[feat]),
+                                         min_value=mn-abs(mn), max_value=mx+abs(mx),
+                                         step=step, format="%.4f")
+
+    if st.button("🔮 Predict Risk Level"):
+        row_df = pd.DataFrame([inputs])[sel_feats]
+        row_sc = scaler.transform(row_df)
+        pred   = best_model.predict(row_sc)[0]
+        proba  = best_model.predict_proba(row_sc)[0]
+        conf   = max(proba) * 100
+        if pred == 1:
+            st.error(  f"## 🔴 HIGH RISK  —  Confidence: {conf:.1f}%")
+        else:
+            st.success(f"## 🟢 LOW RISK   —  Confidence: {conf:.1f}%")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Prob High Risk", f"{proba[1]*100:.1f}%")
+        c2.metric("Prob Low Risk",  f"{proba[0]*100:.1f}%")
+        c3.metric("Model Used",     best_name[:18])
+        fig, ax = plt.subplots(figsize=(7, 1.8), facecolor="#080c14"); apply_dark(ax)
+        ax.barh(["Low Risk"],  [proba[0]], color="#34d399", height=0.4)
+        ax.barh(["High Risk"], [proba[1]], color="#fb7185", height=0.4)
+        ax.set_xlim(0,1); ax.set_title("Prediction Probabilities", color=TEXT, fontsize=10)
+        for sp in ["top","right","left"]: ax.spines[sp].set_visible(False)
+        st.pyplot(fig, use_container_width=True); plt.close()
+
+    st.markdown("---")
+    st.markdown("#### Batch Predictions on Recent Test Rows")
+    n_rows    = st.slider("Number of rows to show", 5, 50, 15)
+    X_samp_sc = scaler.transform(X_test.iloc[-n_rows:])
+    preds_h   = best_model.predict(X_samp_sc)
+    probas_h  = best_model.predict_proba(X_samp_sc)[:,1]
+    hist_df   = X_test.iloc[-n_rows:].copy()
+    hist_df["Predicted"] = ["🔴 HIGH" if p==1 else "🟢 LOW" for p in preds_h]
+    hist_df["Prob High"] = (probas_h*100).round(1)
+    hist_df["Actual"]    = y_test.iloc[-n_rows:].map({1:"🔴 HIGH",0:"🟢 LOW"}).values
+    hist_df["Correct?"]  = (preds_h == y_test.iloc[-n_rows:].values)
+    hist_df["Correct?"]  = hist_df["Correct?"].map({True:"✅",False:"❌"})
+    st.dataframe(hist_df[["Predicted","Prob High","Actual","Correct?"]], use_container_width=True)
 
 # ================================================================
-# STEP 8 — DEPLOY
+# TAB 5 — EXPORT
 # ================================================================
-divider("STEP 8  DEPLOY - SAVE ARTIFACTS")
+with tab5:
+    if "results" not in st.session_state:
+        st.info("⬅️ Run the pipeline first."); st.stop()
 
-joblib.dump(best_model, os.path.join(BASE_DIR, "malaria_model.pkl"))
-joblib.dump(scaler,     os.path.join(BASE_DIR, "malaria_scaler.pkl"))
-joblib.dump(le_region,  os.path.join(BASE_DIR, "malaria_le_region.pkl"))
-joblib.dump(le_county,  os.path.join(BASE_DIR, "malaria_le_county.pkl"))
-pd.Series(sel_feats, name="feature").to_csv(os.path.join(BASE_DIR, "malaria_features.csv"), index=False)
+    results   = st.session_state.results
+    best_name = st.session_state.best_name
+    sel_feats = st.session_state.sel_feats
+    y_test    = st.session_state.y_test
 
-for f in ["malaria_model.pkl","malaria_scaler.pkl",
-          "malaria_le_region.pkl","malaria_le_county.pkl","malaria_features.csv"]:
-    print(f"  Saved: {f:<40} ({os.path.getsize(os.path.join(BASE_DIR, f))/1024:.1f} KB)")
+    st.markdown("### 💾 Download Pipeline Artifacts")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**🧠 Best Model**"); st.caption(f"{best_name} (.pkl)")
+        st.download_button("⬇️ Download Model",   data=st.session_state.buf_model,  file_name="malaria_model.pkl",    mime="application/octet-stream")
+    with c2:
+        st.markdown("**⚖️ Scaler**");             st.caption("StandardScaler (.pkl)")
+        st.download_button("⬇️ Download Scaler",  data=st.session_state.buf_scaler, file_name="malaria_scaler.pkl",   mime="application/octet-stream")
+    with c3:
+        st.markdown("**📋 Features**");            st.caption("Feature list (.csv)")
+        st.download_button("⬇️ Download Features",data=pd.Series(sel_feats,name="feature").to_csv(index=False), file_name="malaria_features.csv", mime="text/csv")
 
+    st.markdown("---")
+    st.markdown("### 📊 Evaluation Summary")
+    summary = pd.DataFrame([{"Model":n,"Accuracy":round(i["acc"],4),"AUC-ROC":round(i["auc"],4),
+                              "F1":round(i["f1"],4),"Precision":round(i["prec"],4),"Recall":round(i["rec"],4)}
+                             for n, i in results.items()])
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.download_button("⬇️ Download Evaluation CSV", data=summary.to_csv(index=False),
+                       file_name="model_evaluation.csv", mime="text/csv")
 
-def predict_risk(input_dict: dict) -> dict:
-    """
-    Predict malaria High-Risk status for a new observation.
+    st.markdown("---")
+    st.markdown("### 🔌 Inference Code")
+    st.code("""
+import joblib, pandas as pd
 
-    Parameters
-    ----------
-    input_dict : dict
-        Must contain keys matching malaria_features.csv (pre-encoded numerics).
+model    = joblib.load("malaria_model.pkl")
+scaler   = joblib.load("malaria_scaler.pkl")
+features = pd.read_csv("malaria_features.csv").squeeze().tolist()
 
-    Returns
-    -------
-    dict : risk_level, confidence, prob_high, prob_low
-
-    Example
-    -------
-    >>> predict_risk({
-    ...     "Incidence_per_100k": 145.0,
-    ...     "Cases_per_Pop": 145.0,
-    ...     "Malaria_Cases": 1200,
-    ...     "Lag_1_Month_Cases": 1100,
-    ...     "Population": 900000,
-    ...     "Lag_Change": 100,
-    ...     "Lag_Ratio": 1.09,
-    ...     "Rainfall_mm": 180.0,
-    ...     "Rain_x_Humidity": 13680.0,
-    ...     "Humidity_percent": 76.0,
-    ...     "Temp_x_Humidity": 1880.0,
-    ...     "Rain_x_Temp": 4320.0,
-    ... })
-    """
-    _model  = joblib.load(os.path.join(BASE_DIR, "malaria_model.pkl"))
-    _scaler = joblib.load(os.path.join(BASE_DIR, "malaria_scaler.pkl"))
-    _feats  = pd.read_csv(os.path.join(BASE_DIR, "malaria_features.csv")).squeeze().tolist()
-    row     = pd.DataFrame([input_dict])[_feats]
-    row_sc  = _scaler.transform(row)
-    pred    = _model.predict(row_sc)[0]
-    proba   = _model.predict_proba(row_sc)[0]
+def predict_risk(row: dict) -> dict:
+    df    = pd.DataFrame([row])[features]
+    sc    = scaler.transform(df)
+    pred  = model.predict(sc)[0]
+    prob  = model.predict_proba(sc)[0]
     return {
-        "risk_level" : "HIGH RISK" if pred == 1 else "LOW RISK",
-        "confidence" : f"{max(proba)*100:.1f}%",
-        "prob_high"  : round(float(proba[1]), 4),
-        "prob_low"   : round(float(proba[0]), 4),
+        "risk":       "HIGH RISK" if pred == 1 else "LOW RISK",
+        "confidence": f"{max(prob)*100:.1f}%",
+        "prob_high":  round(prob[1], 4),
     }
-
-# demo
-demo = predict_risk(dict(zip(sel_feats, X_test.iloc[-1].values)))
-print(f"\n  Demo prediction (last test row): {demo}")
-
-# ================================================================
-# VISUALISATIONS
-# ================================================================
-print("\n  Building pipeline_results.png ...")
-
-fig = plt.figure(figsize=(22, 18), facecolor=BLACK)
-gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.52, wspace=0.38)
-
-# 1. Target distribution
-ax1 = _ax(fig.add_subplot(gs[0, 0]), "Target Distribution")
-bars1 = ax1.bar(["Low Risk (0)", "High Risk (1)"],
-                [vc[0], vc[1]], color=["#34d399","#fb7185"],
-                edgecolor=GRID, width=0.5)
-for b in bars1:
-    ax1.text(b.get_x()+b.get_width()/2, b.get_height()+8,
-             str(int(b.get_height())), ha="center", color=TEXT,
-             fontweight="bold", fontsize=11)
-ax1.set_ylabel("Count", color=TEXT)
-
-# 2. ANOVA F-scores
-ax2 = _ax(fig.add_subplot(gs[0, 1:3]), "ANOVA F-Scores — Top Selected Features")
-fs  = f_scores.head(K).sort_values()
-ax2.barh(fs.index, fs.values,
-         color=[PAL[i % len(PAL)] for i in range(len(fs))],
-         edgecolor=GRID, height=0.65)
-ax2.set_xlabel("F-Score", color=TEXT)
-for i, (val, lbl) in enumerate(zip(fs.values, fs.index)):
-    ax2.text(val + fs.max()*0.01, i, f"{val:.0f}",
-             va="center", color=TEXT, fontsize=7.5)
-
-# 3. Cases by region
-ax3 = _ax(fig.add_subplot(gs[0, 3]), "Avg Cases by Region")
-rg  = df.groupby("Region")["Malaria_Cases"].mean().sort_values()
-ax3.barh([r.replace(" Region","") for r in rg.index],
-         rg.values, color=PAL[:len(rg)], edgecolor=GRID)
-ax3.set_xlabel("Avg Cases", color=TEXT)
-
-# 4. CV AUC
-ax4 = _ax(fig.add_subplot(gs[1, 0]), "5-Fold CV AUC by Model")
-short = ["LR","RF","GBM","SVM"]
-means = [results[n]["cv_mean"] for n in MODELS]
-stds  = [results[n]["cv_std"]  for n in MODELS]
-bars4 = ax4.bar(short, means, yerr=stds, color=PAL[:4],
-                capsize=6, edgecolor=GRID, width=0.55)
-ax4.set_ylim(0, 1.12)
-ax4.set_ylabel("AUC", color=TEXT)
-for b, v in zip(bars4, means):
-    ax4.text(b.get_x()+b.get_width()/2, v+0.03,
-             f"{v:.4f}", ha="center", color=TEXT, fontsize=8)
-
-# 5. Test metrics
-ax5 = _ax(fig.add_subplot(gs[1, 1]), "Test Metrics — All Models")
-mets  = ["acc","auc","f1","prec","rec"]
-xlbls = ["Acc","AUC","F1","Prec","Recall"]
-x, w  = np.arange(len(mets)), 0.18
-for i, (name, info) in enumerate(results.items()):
-    ax5.bar(x + i*w, [info[m] for m in mets], w,
-            label=short[i], color=PAL[i], edgecolor=GRID, alpha=0.88)
-ax5.set_xticks(x + w*1.5)
-ax5.set_xticklabels(xlbls, color=TEXT, fontsize=8)
-ax5.set_ylim(0, 1.15)
-ax5.legend(labelcolor=TEXT, facecolor=BG, fontsize=8, ncol=2, framealpha=0.4)
-
-# 6. ROC curves
-ax6 = _ax(fig.add_subplot(gs[1, 2]), "ROC Curves")
-for i, (name, info) in enumerate(results.items()):
-    fpr, tpr, _ = roc_curve(y_test, info["y_proba"])
-    ax6.plot(fpr, tpr, color=PAL[i], lw=2,
-             label=f"{short[i]}  AUC={info['auc']:.3f}")
-ax6.plot([0,1],[0,1],"--",color=GRID,lw=1)
-ax6.set_xlabel("False Positive Rate", color=TEXT)
-ax6.set_ylabel("True Positive Rate", color=TEXT)
-ax6.legend(labelcolor=TEXT, facecolor=BG, fontsize=8, framealpha=0.4)
-
-# 7. Confusion matrix
-ax7 = _ax(fig.add_subplot(gs[1, 3]), f"Confusion Matrix ({best_name[:10]}...)")
-cm  = results[best_name]["cm"]
-ax7.imshow(cm, cmap="Blues", aspect="auto")
-for i in range(2):
-    for j in range(2):
-        ax7.text(j, i, f"{cm[i,j]}", ha="center", va="center",
-                 color="white", fontsize=18, fontweight="bold")
-ax7.set_xticks([0,1]); ax7.set_yticks([0,1])
-ax7.set_xticklabels(["Low","High"], color=TEXT)
-ax7.set_yticklabels(["Low","High"], color=TEXT)
-ax7.set_xlabel("Predicted", color=TEXT); ax7.set_ylabel("Actual", color=TEXT)
-
-# 8. Incidence histograms
-ax8 = _ax(fig.add_subplot(gs[2, 0:2]), "Incidence per 100k — Risk Groups")
-low_i  = df[df[TARGET]==0]["Incidence_per_100k"]
-high_i = df[df[TARGET]==1]["Incidence_per_100k"]
-ax8.hist(low_i,  bins=45, color="#34d399", alpha=0.70,
-         label=f"Low Risk  (n={len(low_i)})", edgecolor=GRID)
-ax8.hist(high_i, bins=45, color="#fb7185", alpha=0.70,
-         label=f"High Risk (n={len(high_i)})", edgecolor=GRID)
-ax8.axvline(df["Incidence_per_100k"].median(),
-            color="#fbbf24", linestyle="--", lw=1.5, label="Overall Median")
-ax8.set_xlabel("Incidence per 100 000", color=TEXT)
-ax8.set_ylabel("Frequency", color=TEXT)
-ax8.legend(labelcolor=TEXT, facecolor=BG, fontsize=9, framealpha=0.4)
-
-# 9. Monthly trend
-ax9 = _ax(fig.add_subplot(gs[2, 2]), "Avg Malaria Cases by Month")
-mo  = df.groupby("Month")["Malaria_Cases"].mean()
-ax9.fill_between(mo.index, mo.values, alpha=0.18, color=PAL[0])
-ax9.plot(mo.index, mo.values, color=PAL[0], lw=2.5,
-         marker="o", markersize=5)
-ax9.set_xlabel("Month", color=TEXT)
-ax9.set_ylabel("Avg Cases", color=TEXT)
-ax9.set_xticks(range(1, 13))
-for xv in [3, 10]:
-    ax9.axvspan(xv, xv+3, alpha=0.07, color="#34d399")
-
-# 10. Pipeline card
-ax10 = _ax(fig.add_subplot(gs[2, 3]), "Pipeline Summary")
-ax10.axis("off")
-info_best = results[best_name]
-lines = [
-    ("DATASET",       "1 500 rows  3 regions  21 counties"),
-    ("CLEANING",      "Dropped 5 cols (>=40% null), 0 dupes"),
-    ("ENGINEERING",   "7 new interaction features derived"),
-    ("SELECTION",     f"Top {K} via ANOVA F-score"),
-    ("SPLIT",         "80 / 20  stratified"),
-    ("MODELS",        "LR  RF  GBM  SVM"),
-    ("BEST MODEL",    best_name),
-    ("  AUC",         f"{info_best['auc']:.4f}"),
-    ("  F1 Score",    f"{info_best['f1']:.4f}"),
-    ("  Accuracy",    f"{info_best['acc']:.4f}"),
-    ("DEPLOY",        "4 .pkl + features.csv  saved"),
-]
-for i, (lbl, val) in enumerate(lines):
-    yp = 0.97 - i * 0.088
-    ax10.text(0.02, yp, lbl, color=PAL[i % len(PAL)], fontsize=8,
-              fontweight="bold", transform=ax10.transAxes, fontfamily="monospace")
-    ax10.text(0.42, yp, val, color=TEXT, fontsize=7.8, transform=ax10.transAxes)
-
-fig.suptitle("Malaria High-Risk Predictor  -  Full ML Pipeline",
-             color="white", fontsize=17, fontweight="bold", y=0.998)
-
-plt.savefig("pipeline_results.png", dpi=150,
-            bbox_inches="tight", facecolor=fig.get_facecolor())
-plt.close()
-print("  pipeline_results.png saved")
-print(f"\n{'='*65}")
-print("  PIPELINE COMPLETE")
-print(f"{'='*65}")
+""", language="python")
