@@ -411,12 +411,12 @@ ID, Health_Facilities, Avg_Income, Disease_Cases, Notes
 #  TABS
 # ════════════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📊 Data Explorer",
-    "🧹 Cleaning",
-    "🧠 Training",
-    "📈 Evaluation",
-    "🔮 Predict",
-    "💾 Export",
+    " Data Explorer",
+    " Cleaning",
+    " Training",
+    " Evaluation",
+    " Predict",
+    " Export",
 ])
 
 # ────────────────────────────────────────────────────────────────
