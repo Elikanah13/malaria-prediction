@@ -1,6 +1,5 @@
 """
 Malaria Infection Prediction App
-Group 3 — Meru University of Science and Technology
 Models: Logistic Regression | Random Forest | Gradient Boosting
 """
 
@@ -24,16 +23,16 @@ from sklearn.metrics import (
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Malaria Prediction | Group 3",
-    page_icon="🦟",
+    page_icon="",
     layout="wide"
 )
 
-st.title("🦟 Malaria Infection Prediction")
+st.title(" Malaria Infection Prediction")
 st.markdown("**Group 3 · Meru University of Science and Technology · BSc Data Science**")
 st.markdown("---")
 
 # ── Sidebar — upload ─────────────────────────────────────────
-st.sidebar.header("📂 Dataset")
+st.sidebar.header(" Dataset")
 uploaded = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"])
 
 # ── Load data ────────────────────────────────────────────────
@@ -44,7 +43,7 @@ def load_data(file):
 if uploaded:
     df_raw = load_data(uploaded)
 else:
-    st.info("👈 Please upload **Final_Malaria_Dataset.csv** in the sidebar to begin.")
+    st.info(" Please upload **Final_Malaria_Dataset.csv** in the sidebar to begin.")
     st.stop()
 
 st.subheader("📋 Raw Data Preview")
@@ -132,7 +131,7 @@ if not models_sel:
     st.warning("Please select at least one model.")
     st.stop()
 
-run_btn = st.sidebar.button("🚀 Train Models", type="primary")
+run_btn = st.sidebar.button(" Train Models", type="primary")
 
 if not run_btn:
     st.info("Configure settings in the sidebar and click **Train Models** to start.")
@@ -226,7 +225,7 @@ st.dataframe(
     summary_df.style.highlight_max(axis=0, color='#d4edda'),
     use_container_width=True
 )
-st.success(f"🏆 **Best Model: {best_model}** — F1 Score = {summary_df.loc[best_model,'F1 Score']:.4f}")
+st.success(f" **Best Model: {best_model}** — F1 Score = {summary_df.loc[best_model,'F1 Score']:.4f}")
 
 if run_tuning:
     with st.expander("Best Hyperparameters"):
