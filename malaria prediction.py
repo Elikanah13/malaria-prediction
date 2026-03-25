@@ -55,23 +55,17 @@ st.markdown(f"**Shape:** {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
 def preprocess(df):
     df = df.copy()
 
-    # Drop sparse / non-feature columns
     drop_cols = ['ID', 'Health_Facilities', 'Avg_Income', 'Disease_Cases', 'Notes']
     df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
-
-    # Remove duplicates
     df.drop_duplicates(inplace=True)
 
-    # Standardise strings
     df['Region'] = df['Region'].str.strip().str.title()
     df['County'] = df['County'].str.strip().str.title()
 
-    # Impute numerics with median
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     imp = SimpleImputer(strategy='median')
     df[num_cols] = imp.fit_transform(df[num_cols])
 
-    # Outlier capping (IQR)
     cap_cols = ['Rainfall_mm', 'Temperature_C', 'Humidity_percent',
                 'Malaria_Cases', 'Lag_1_Month_Cases', 'Incidence_per_100k']
     for col in cap_cols:
@@ -80,7 +74,6 @@ def preprocess(df):
             IQR = Q3 - Q1
             df[col] = df[col].clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)
 
-    # Feature engineering
     def get_season(m):
         if m in [3,4,5]:    return 'Long_Rains'
         elif m in [6,7,8]:  return 'Dry'
@@ -239,7 +232,6 @@ tab1, tab2, tab3 = st.tabs(["Metric Comparison", "Confusion Matrices", "ROC Curv
 
 COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444']
 
-# Tab 1 — Bar chart
 with tab1:
     fig, ax = plt.subplots(figsize=(10, 5))
     x     = np.arange(len(metric_cols))
@@ -261,7 +253,6 @@ with tab1:
     st.pyplot(fig)
     plt.close()
 
-# Tab 2 — Confusion matrices
 with tab2:
     cols = st.columns(len(models_sel))
     for i, name in enumerate(models_sel):
@@ -286,11 +277,9 @@ with tab2:
         cols[i].pyplot(fig)
         plt.close()
 
-# Tab 3 — ROC curves
 with tab3:
     fig, ax = plt.subplots(figsize=(8, 6))
     for i, name in enumerate(models_sel):
-        Xte = X_test_sc if name == "Logistic Regression" else X_test
         fpr, tpr, _ = roc_curve(y_test, results[name]['y_prob'])
         auc = results[name]['ROC-AUC']
         ax.plot(fpr, tpr, lw=2.2, color=COLORS[i], label=f'{name} (AUC={auc:.3f})')
@@ -316,29 +305,54 @@ if "Random Forest" in results:
     st.pyplot(fig)
     plt.close()
 
-# ── Live prediction form ──────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════
+# ── Section 1: Predict a New Case (free-form, no fixed limits) ──
+# ════════════════════════════════════════════════════════════════
+st.markdown("---")
 st.subheader("🔮 Predict a New Case")
-st.markdown("Enter climate and case data below to predict malaria risk:")
+st.markdown(
+    "Enter **any values** below — there are no fixed limits. "
+    "Type in real figures from your dataset or hypothetical scenarios to see how the models respond."
+)
+
+# Helper: derive dataset min/max as soft hints shown in captions
+def hint(col):
+    if col in X.columns:
+        lo, hi = X[col].min(), X[col].max()
+        return f"Dataset range: {lo:.1f} – {hi:.1f}"
+    return ""
 
 with st.form("predict_form"):
+    st.markdown("##### 🌦️ Climate Inputs")
     c1, c2, c3 = st.columns(3)
-    rainfall    = c1.number_input("Rainfall (mm)",       0.0, 500.0, 100.0)
-    temperature = c2.number_input("Temperature (°C)",    10.0, 40.0,  25.0)
-    humidity    = c3.number_input("Humidity (%)",         0.0, 100.0, 65.0)
+    rainfall    = c1.number_input("Rainfall (mm)",      value=100.0, step=0.1,
+                                   help=hint('Rainfall_mm'))
+    temperature = c2.number_input("Temperature (°C)",   value=25.0,  step=0.1,
+                                   help=hint('Temperature_C'))
+    humidity    = c3.number_input("Humidity (%)",        value=65.0,  step=0.1,
+                                   help=hint('Humidity_percent'))
 
+    st.markdown("##### 🦟 Case & Population Inputs")
     c4, c5, c6 = st.columns(3)
-    lag_cases   = c4.number_input("Lag 1 Month Cases",   0.0, 5000.0, 500.0)
-    incidence   = c5.number_input("Incidence per 100k",  0.0, 1000.0, 100.0)
-    month       = c6.slider("Month", 1, 12, 6)
+    lag_cases   = c4.number_input("Lag 1 Month Cases",  value=500.0, step=1.0,
+                                   help=hint('Lag_1_Month_Cases'))
+    incidence   = c5.number_input("Incidence per 100k", value=100.0, step=0.1,
+                                   help=hint('Incidence_per_100k'))
+    month       = c6.number_input("Month (1–12)",        value=6,    step=1,
+                                   min_value=1, max_value=12,
+                                   help="Calendar month of the observation")
 
     c7, c8     = st.columns(2)
-    population = c7.number_input("Population",     10000, 5000000, 500000)
-    mal_cases  = c8.number_input("Malaria Cases",  0.0,   10000.0, 500.0)
+    population = c7.number_input("Population",          value=500000, step=1000,
+                                  help=hint('Population'))
+    mal_cases  = c8.number_input("Malaria Cases",       value=500.0,  step=1.0,
+                                  help=hint('Malaria_Cases'))
 
-    submitted = st.form_submit_button("Predict Risk", type="primary")
+    submitted = st.form_submit_button("🔍 Predict Risk", type="primary")
 
 if submitted:
-    cases_pc = mal_cases / population * 100000
+    cases_pc = mal_cases / max(population, 1) * 100000
 
     def get_season(m):
         if m in [3,4,5]:    return 'Long_Rains'
@@ -351,21 +365,197 @@ if submitted:
 
     input_df = pd.DataFrame([[
         rainfall, temperature, humidity, lag_cases, incidence,
-        month, population, mal_cases, cases_pc,
-        0, 0, season_enc
+        month, population, mal_cases, cases_pc, 0, 0, season_enc
     ]], columns=FEATURES)
 
     st.markdown("### 🎯 Prediction Results")
     pred_cols = st.columns(len(models_sel))
     for i, name in enumerate(models_sel):
-        if name == "Logistic Regression":
-            inp = scaler.transform(input_df)
-        else:
-            inp = input_df
+        inp   = scaler.transform(input_df) if name == "Logistic Regression" else input_df
         pred  = results[name]['model'].predict(inp)[0]
         prob  = results[name]['model'].predict_proba(inp)[0][1]
         label = "🔴 HIGH RISK" if pred == 1 else "🟢 LOW RISK"
         pred_cols[i].metric(name, label, f"Confidence: {prob*100:.1f}%")
+
+    with st.expander("📋 View input summary"):
+        summary = pd.DataFrame({
+            'Feature': ['Rainfall (mm)', 'Temperature (°C)', 'Humidity (%)',
+                        'Lag 1 Month Cases', 'Incidence per 100k', 'Month',
+                        'Population', 'Malaria Cases', 'Cases per Capita', 'Season'],
+            'Value':   [rainfall, temperature, humidity, lag_cases, incidence,
+                        month, population, mal_cases, round(cases_pc, 2),
+                        get_season(month)]
+        })
+        st.dataframe(summary, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════
+# ── Section 2: Custom Training Experiment (dataset copy only) ───
+# ════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.subheader("🧪 Custom Training Experiment")
+st.markdown(
+    "Retrain models on a **filtered copy** of your dataset to test how different "
+    "data slices affect performance. **The original dataset is never modified.**"
+)
+
+with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
+
+    st.markdown("##### Step 1 — Filter the dataset copy")
+    fc1, fc2 = st.columns(2)
+
+    # Month range filter
+    month_range = fc1.slider(
+        "Include months", 1, 12, (1, 12),
+        help="Keep only rows whose Month falls within this range"
+    )
+
+    # Rainfall filter
+    rain_min_val = float(X['Rainfall_mm'].min())
+    rain_max_val = float(X['Rainfall_mm'].max())
+    rain_range = fc2.slider(
+        "Rainfall range (mm)",
+        rain_min_val, rain_max_val,
+        (rain_min_val, rain_max_val),
+        help="Keep only rows within this rainfall band"
+    )
+
+    fc3, fc4 = st.columns(2)
+    temp_min_val = float(X['Temperature_C'].min())
+    temp_max_val = float(X['Temperature_C'].max())
+    temp_range = fc3.slider(
+        "Temperature range (°C)",
+        temp_min_val, temp_max_val,
+        (temp_min_val, temp_max_val)
+    )
+
+    # Sample size
+    max_rows = len(X)
+    sample_pct = fc4.slider(
+        "Use what % of filtered rows",
+        10, 100, 100,
+        help="Randomly sample this percentage of the filtered dataset for training"
+    )
+
+    st.markdown("##### Step 2 — Choose a model")
+    exp_model_name = st.selectbox(
+        "Model for this experiment",
+        ["Logistic Regression", "Random Forest", "Gradient Boosting"]
+    )
+
+    exp_test_size = st.slider("Experiment test split %", 10, 40, 20) / 100
+
+    run_exp = st.button("▶️ Run Custom Experiment", type="primary")
+
+    if run_exp:
+        # --- Work on a COPY of X and y, never df_raw ---
+        X_exp = X.copy()
+        y_exp = y.copy()
+
+        # Apply filters
+        mask = (
+            (X_exp['Month'] >= month_range[0]) & (X_exp['Month'] <= month_range[1]) &
+            (X_exp['Rainfall_mm'] >= rain_range[0]) & (X_exp['Rainfall_mm'] <= rain_range[1]) &
+            (X_exp['Temperature_C'] >= temp_range[0]) & (X_exp['Temperature_C'] <= temp_range[1])
+        )
+        X_exp = X_exp[mask]
+        y_exp = y_exp[mask]
+
+        # Sample
+        if sample_pct < 100:
+            sample_n = max(int(len(X_exp) * sample_pct / 100), 10)
+            idx = np.random.RandomState(42).choice(len(X_exp), sample_n, replace=False)
+            X_exp = X_exp.iloc[idx]
+            y_exp = y_exp.iloc[idx]
+
+        if len(X_exp) < 20:
+            st.error("⚠️ Not enough rows after filtering (need at least 20). "
+                     "Please widen your filter ranges.")
+        elif y_exp.nunique() < 2:
+            st.error("⚠️ Filtered data contains only one class — cannot train a classifier. "
+                     "Please adjust the filters.")
+        else:
+            st.info(
+                f"🔬 Training on **{len(X_exp)} rows** "
+                f"({int((y_exp==0).sum())} low-risk, {int((y_exp==1).sum())} high-risk) "
+                f"— original dataset untouched ({len(X)} rows)."
+            )
+
+            Xtr_e, Xte_e, ytr_e, yte_e = train_test_split(
+                X_exp, y_exp, test_size=exp_test_size, random_state=42, stratify=y_exp
+            )
+
+            sc_e = StandardScaler()
+            Xtr_e_sc = sc_e.fit_transform(Xtr_e)
+            Xte_e_sc = sc_e.transform(Xte_e)
+
+            # Train chosen model (no grid search to keep it fast)
+            if exp_model_name == "Logistic Regression":
+                m_exp = LogisticRegression(max_iter=1000, random_state=42)
+                m_exp.fit(Xtr_e_sc, ytr_e)
+                yp_e  = m_exp.predict(Xte_e_sc)
+                ypr_e = m_exp.predict_proba(Xte_e_sc)[:, 1]
+            elif exp_model_name == "Random Forest":
+                m_exp = RandomForestClassifier(n_estimators=100, random_state=42)
+                m_exp.fit(Xtr_e, ytr_e)
+                yp_e  = m_exp.predict(Xte_e)
+                ypr_e = m_exp.predict_proba(Xte_e)[:, 1]
+            else:
+                m_exp = GradientBoostingClassifier(n_estimators=100, random_state=42)
+                m_exp.fit(Xtr_e, ytr_e)
+                yp_e  = m_exp.predict(Xte_e)
+                ypr_e = m_exp.predict_proba(Xte_e)[:, 1]
+
+            # Metrics
+            exp_metrics = {
+                'Accuracy':  round(accuracy_score(yte_e, yp_e), 4),
+                'Precision': round(precision_score(yte_e, yp_e, zero_division=0), 4),
+                'Recall':    round(recall_score(yte_e, yp_e, zero_division=0), 4),
+                'F1 Score':  round(f1_score(yte_e, yp_e, zero_division=0), 4),
+                'ROC-AUC':   round(roc_auc_score(yte_e, ypr_e), 4),
+            }
+
+            st.markdown(f"#### 📊 Results — {exp_model_name} (Custom Experiment)")
+            ec1, ec2, ec3, ec4, ec5 = st.columns(5)
+            for col, (metric, val) in zip([ec1,ec2,ec3,ec4,ec5], exp_metrics.items()):
+
+                # Compare against the same model trained on full data (if available)
+                delta_str = None
+                if exp_model_name in results:
+                    delta_val = val - results[exp_model_name][metric]
+                    delta_str = f"{delta_val:+.4f} vs full data"
+                col.metric(metric, f"{val:.4f}", delta_str)
+
+            # Side-by-side confusion matrix vs full-data model
+            if exp_model_name in results:
+                st.markdown("##### Confusion Matrix Comparison")
+                cm_cols = st.columns(2)
+
+                for idx_cm, (label_cm, cm_data) in enumerate([
+                    (f"{exp_model_name} — Custom ({len(X_exp)} rows)",
+                     confusion_matrix(yte_e, yp_e)),
+                    (f"{exp_model_name} — Full Data ({len(X)} rows)",
+                     results[exp_model_name]['cm']),
+                ]):
+                    fig, ax = plt.subplots(figsize=(4, 3.5))
+                    im = ax.imshow(cm_data, interpolation='nearest', cmap='Purples')
+                    plt.colorbar(im, ax=ax)
+                    ax.set_xticks([0,1]); ax.set_yticks([0,1])
+                    ax.set_xticklabels(['Low Risk','High Risk'], rotation=30, fontsize=9)
+                    ax.set_yticklabels(['Low Risk','High Risk'], fontsize=9)
+                    thresh = cm_data.max() / 2
+                    for r in range(2):
+                        for c in range(2):
+                            ax.text(c, r, str(cm_data[r, c]),
+                                    ha='center', va='center', fontsize=13, fontweight='bold',
+                                    color='white' if cm_data[r,c] > thresh else 'black')
+                    ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+                    ax.set_title(label_cm, fontweight='bold', fontsize=9)
+                    plt.tight_layout()
+                    cm_cols[idx_cm].pyplot(fig)
+                    plt.close()
+            else:
+                st.info("Train the main models first to see a side-by-side comparison.")
 
 # ── Footer ────────────────────────────────────────────────────
 st.markdown("---")
