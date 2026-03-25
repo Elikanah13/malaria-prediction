@@ -1,38 +1,42 @@
 """
 Malaria Infection Prediction App
 Models: Logistic Regression | Random Forest | Gradient Boosting
++ Future Trend Forecasting (Cases & High-Risk Probability)
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score,
-    f1_score, confusion_matrix, roc_auc_score, roc_curve
+    f1_score, confusion_matrix, roc_auc_score, roc_curve,
+    mean_absolute_error, mean_squared_error
 )
+from scipy import stats
 
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Malaria Prediction | Group 3",
-    page_icon="",
+    page_icon="🦟",
     layout="wide"
 )
 
-st.title(" Malaria Infection Prediction")
+st.title("🦟 Malaria Infection Prediction")
 st.markdown("**Group 3 · Meru University of Science and Technology · BSc Data Science**")
 st.markdown("---")
 
 # ── Sidebar — upload ─────────────────────────────────────────
-st.sidebar.header(" Dataset")
+st.sidebar.header("📂 Dataset")
 uploaded = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"])
 
 # ── Load data ────────────────────────────────────────────────
@@ -43,7 +47,7 @@ def load_data(file):
 if uploaded:
     df_raw = load_data(uploaded)
 else:
-    st.info(" Please upload **Final_Malaria_Dataset.csv** in the sidebar to begin.")
+    st.info("📁 Please upload **Final_Malaria_Dataset.csv** in the sidebar to begin.")
     st.stop()
 
 st.subheader("📋 Raw Data Preview")
@@ -96,9 +100,9 @@ def preprocess(df):
 
     X = df[FEATURES]
     y = df[TARGET].astype(int)
-    return X, y, FEATURES
+    return X, y, FEATURES, df
 
-X, y, FEATURES = preprocess(df_raw)
+X, y, FEATURES, df_processed = preprocess(df_raw)
 
 # ── Data stats ───────────────────────────────────────────────
 st.subheader("📊 Dataset Statistics")
@@ -124,7 +128,7 @@ if not models_sel:
     st.warning("Please select at least one model.")
     st.stop()
 
-run_btn = st.sidebar.button(" Train Models", type="primary")
+run_btn = st.sidebar.button("🚀 Train Models", type="primary")
 
 if not run_btn:
     st.info("Configure settings in the sidebar and click **Train Models** to start.")
@@ -218,7 +222,7 @@ st.dataframe(
     summary_df.style.highlight_max(axis=0, color='#d4edda'),
     use_container_width=True
 )
-st.success(f" **Best Model: {best_model}** — F1 Score = {summary_df.loc[best_model,'F1 Score']:.4f}")
+st.success(f"🏆 **Best Model: {best_model}** — F1 Score = {summary_df.loc[best_model,'F1 Score']:.4f}")
 
 if run_tuning:
     with st.expander("Best Hyperparameters"):
@@ -316,7 +320,6 @@ st.markdown(
     "Type in real figures from your dataset or hypothetical scenarios to see how the models respond."
 )
 
-# Helper: derive dataset min/max as soft hints shown in captions
 def hint(col):
     if col in X.columns:
         lo, hi = X[col].min(), X[col].max()
@@ -389,8 +392,370 @@ if submitted:
         st.dataframe(summary, use_container_width=True)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ── Section 2: Future Trend Prediction ──────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.subheader("📅 Future Trend Prediction")
+st.markdown(
+    "Forecast **malaria cases** and **high-risk probability** for upcoming months "
+    "using time-series regression trained on your historical data."
+)
+
+# ── Helper: build a time index ───────────────────────────────────────────────
+@st.cache_data
+def build_time_series(df):
+    """
+    Aggregate the processed dataset into a monthly time series.
+    If a Year column exists use it; otherwise create a synthetic index.
+    Returns a DataFrame indexed 0, 1, 2, … (months elapsed).
+    """
+    d = df.copy()
+
+    has_year = 'Year' in d.columns
+    if has_year:
+        d['time_idx'] = (d['Year'] - d['Year'].min()) * 12 + (d['Month'] - 1)
+        ts = (d.groupby('time_idx')
+               .agg(
+                   Malaria_Cases   =('Malaria_Cases',      'mean'),
+                   Incidence       =('Incidence_per_100k', 'mean'),
+                   Rainfall        =('Rainfall_mm',        'mean'),
+                   Temperature     =('Temperature_C',      'mean'),
+                   Humidity        =('Humidity_percent',   'mean'),
+                   High_Risk_Rate  =('High_Risk_Binary',   'mean'),
+                   Month           =('Month',              'first'),
+               )
+               .reset_index())
+    else:
+        # No Year column — use row order aggregated by Month only
+        ts = (d.groupby('Month')
+               .agg(
+                   Malaria_Cases  =('Malaria_Cases',      'mean'),
+                   Incidence      =('Incidence_per_100k', 'mean'),
+                   Rainfall       =('Rainfall_mm',        'mean'),
+                   Temperature    =('Temperature_C',      'mean'),
+                   Humidity       =('Humidity_percent',   'mean'),
+                   High_Risk_Rate =('High_Risk_Binary',   'mean'),
+               )
+               .reset_index()
+               .rename(columns={'Month': 'time_idx'}))
+        ts['Month'] = ts['time_idx']
+
+    ts = ts.sort_values('time_idx').reset_index(drop=True)
+    ts['t'] = np.arange(len(ts))          # linear time counter
+    return ts, has_year
+
+
+@st.cache_data
+def build_forecast_features(ts):
+    """
+    Build Fourier + trend features for the regression forecaster.
+    """
+    t      = ts['t'].values
+    month  = ts['Month'].values
+    n      = len(t)
+
+    # Fourier terms (annual cycle) — 2 harmonics
+    sin1 = np.sin(2 * np.pi * month / 12)
+    cos1 = np.cos(2 * np.pi * month / 12)
+    sin2 = np.sin(4 * np.pi * month / 12)
+    cos2 = np.cos(4 * np.pi * month / 12)
+
+    feats = np.column_stack([
+        t,           # linear trend
+        t**2,        # quadratic trend
+        sin1, cos1,  # fundamental frequency
+        sin2, cos2,  # 2nd harmonic
+        ts['Rainfall'].values,
+        ts['Temperature'].values,
+        ts['Humidity'].values,
+    ])
+    return feats
+
+
+def make_future_feats(ts, n_ahead):
+    """
+    Generate feature matrix for the next n_ahead time steps.
+    Climate columns are projected as rolling-mean of last 12 observations.
+    """
+    t_last  = ts['t'].max()
+    t_fut   = np.arange(t_last + 1, t_last + 1 + n_ahead)
+    # month cycles
+    last_month = int(ts['Month'].iloc[-1])
+    months_fut = np.array([(last_month + i - 1) % 12 + 1 for i in range(1, n_ahead + 1)])
+
+    sin1 = np.sin(2 * np.pi * months_fut / 12)
+    cos1 = np.cos(2 * np.pi * months_fut / 12)
+    sin2 = np.sin(4 * np.pi * months_fut / 12)
+    cos2 = np.cos(4 * np.pi * months_fut / 12)
+
+    # Use trailing averages for climate drivers
+    window = min(12, len(ts))
+    rain_f = np.full(n_ahead, ts['Rainfall'].iloc[-window:].mean())
+    temp_f = np.full(n_ahead, ts['Temperature'].iloc[-window:].mean())
+    hum_f  = np.full(n_ahead, ts['Humidity'].iloc[-window:].mean())
+
+    feats = np.column_stack([
+        t_fut, t_fut**2,
+        sin1, cos1, sin2, cos2,
+        rain_f, temp_f, hum_f,
+    ])
+    return feats, months_fut
+
+
+# ── Build time series ────────────────────────────────────────
+ts, has_year = build_time_series(df_processed)
+
+with st.expander("📊 Historical Monthly Aggregated Data", expanded=False):
+    st.dataframe(ts.round(2), use_container_width=True)
+    st.caption(
+        f"{'Year × Month' if has_year else 'Month-only'} aggregation · "
+        f"{len(ts)} time steps"
+    )
+
+# ── Forecast controls ────────────────────────────────────────
+st.markdown("#### ⚙️ Forecast Settings")
+fc1, fc2, fc3 = st.columns(3)
+n_ahead     = fc1.slider("Months to forecast ahead", 3, 24, 12)
+conf_int    = fc2.checkbox("Show 95% confidence band", value=True)
+show_decomp = fc3.checkbox("Show trend decomposition", value=False)
+
+run_forecast = st.button("📈 Generate Forecast", type="primary")
+
+if run_forecast:
+    if len(ts) < 6:
+        st.error("⚠️ Need at least 6 time steps in the dataset to build a reliable forecast.")
+    else:
+        # ── Train forecasting regressors ─────────────────────────
+        X_ts   = build_forecast_features(ts)
+        y_cas  = ts['Malaria_Cases'].values
+        y_risk = ts['High_Risk_Rate'].values
+
+        # Gradient Boosting for cases (handles non-linearity well)
+        gb_cas  = GradientBoostingRegressor(n_estimators=200, max_depth=3,
+                                             learning_rate=0.05, random_state=42)
+        gb_cas.fit(X_ts, y_cas)
+
+        # Ridge regression for risk rate (bounded 0–1, smoother)
+        ridge_risk = Ridge(alpha=1.0)
+        ridge_risk.fit(X_ts, y_risk)
+
+        # ── In-sample fit metrics ────────────────────────────────
+        cas_pred_is  = gb_cas.predict(X_ts)
+        risk_pred_is = ridge_risk.predict(X_ts).clip(0, 1)
+
+        mae_cas  = mean_absolute_error(y_cas, cas_pred_is)
+        rmse_cas = np.sqrt(mean_squared_error(y_cas, cas_pred_is))
+        mae_risk = mean_absolute_error(y_risk, risk_pred_is)
+
+        # ── Future features ──────────────────────────────────────
+        X_fut, months_fut = make_future_feats(ts, n_ahead)
+
+        cas_fut  = gb_cas.predict(X_fut)
+        risk_fut = ridge_risk.predict(X_fut).clip(0, 1)
+
+        # ── Bootstrap confidence intervals ───────────────────────
+        if conf_int:
+            n_boot = 200
+            rng = np.random.RandomState(42)
+            cas_boots  = np.zeros((n_boot, n_ahead))
+            risk_boots = np.zeros((n_boot, n_ahead))
+
+            residuals_cas  = y_cas - cas_pred_is
+            residuals_risk = y_risk - risk_pred_is
+
+            for b in range(n_boot):
+                res_c = rng.choice(residuals_cas, size=n_ahead, replace=True)
+                res_r = rng.choice(residuals_risk, size=n_ahead, replace=True)
+                cas_boots[b]  = cas_fut + res_c
+                risk_boots[b] = np.clip(risk_fut + res_r, 0, 1)
+
+            cas_lo,  cas_hi  = np.percentile(cas_boots, [2.5, 97.5], axis=0)
+            risk_lo, risk_hi = np.percentile(risk_boots, [2.5, 97.5], axis=0)
+
+        # ── Build result DataFrames ──────────────────────────────
+        future_steps = np.arange(ts['t'].max() + 1,
+                                  ts['t'].max() + 1 + n_ahead)
+        forecast_df = pd.DataFrame({
+            'Step':               future_steps,
+            'Month':              months_fut,
+            'Forecasted_Cases':   np.round(cas_fut, 1),
+            'Forecasted_Risk_%':  np.round(risk_fut * 100, 2),
+            'Risk_Label':         ['🔴 High' if r >= 0.5 else '🟢 Low' for r in risk_fut],
+        })
+
+        # ── Summary metrics ──────────────────────────────────────
+        st.markdown("#### 📋 Forecast Quality (In-Sample Fit)")
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Cases MAE",    f"{mae_cas:.1f}")
+        mc2.metric("Cases RMSE",   f"{rmse_cas:.1f}")
+        mc3.metric("Risk Rate MAE", f"{mae_risk:.4f}")
+
+        # ── Plot 1: Malaria Cases Forecast ───────────────────────
+        st.markdown("#### 📉 Malaria Cases — Historical + Forecast")
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        hist_t = ts['t'].values
+        ax.plot(hist_t, y_cas, 'o-', color='#3B82F6', lw=2,
+                markersize=5, label='Historical (actual)', zorder=3)
+        ax.plot(hist_t, cas_pred_is, '--', color='#94A3B8', lw=1.5,
+                label='In-sample fit', alpha=0.7)
+        ax.plot(future_steps, cas_fut, 's-', color='#EF4444', lw=2.5,
+                markersize=6, label=f'Forecast (+{n_ahead} months)', zorder=3)
+
+        if conf_int:
+            ax.fill_between(future_steps, cas_lo, cas_hi,
+                            color='#EF4444', alpha=0.15, label='95% CI')
+
+        ax.axvline(x=hist_t[-1] + 0.5, color='grey', linestyle=':', lw=1.5, alpha=0.7)
+        ax.text(hist_t[-1] + 0.7, ax.get_ylim()[1]*0.95,
+                '← History | Forecast →', fontsize=9, color='grey')
+        ax.set_xlabel('Time Step (months elapsed)', fontsize=11)
+        ax.set_ylabel('Avg Malaria Cases', fontsize=11)
+        ax.set_title('Malaria Cases Trend Forecast', fontweight='bold', fontsize=13)
+        ax.legend(fontsize=10)
+        ax.spines[['top','right']].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Plot 2: High-Risk Probability Forecast ───────────────
+        st.markdown("#### 🔴 High-Risk Probability — Historical + Forecast")
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        ax.plot(hist_t, y_risk * 100, 'o-', color='#10B981', lw=2,
+                markersize=5, label='Historical high-risk rate', zorder=3)
+        ax.plot(hist_t, risk_pred_is * 100, '--', color='#94A3B8', lw=1.5,
+                label='In-sample fit', alpha=0.7)
+        ax.plot(future_steps, risk_fut * 100, 's-', color='#F59E0B', lw=2.5,
+                markersize=6, label=f'Forecast (+{n_ahead} months)', zorder=3)
+
+        if conf_int:
+            ax.fill_between(future_steps, risk_lo * 100, risk_hi * 100,
+                            color='#F59E0B', alpha=0.15, label='95% CI')
+
+        ax.axhline(50, color='#EF4444', lw=1, linestyle='--', alpha=0.5)
+        ax.text(0.01, 51, 'High-risk threshold (50%)', transform=ax.get_xaxis_transform(),
+                fontsize=8, color='#EF4444')
+        ax.axvline(x=hist_t[-1] + 0.5, color='grey', linestyle=':', lw=1.5, alpha=0.7)
+        ax.set_xlabel('Time Step (months elapsed)', fontsize=11)
+        ax.set_ylabel('High-Risk Rate (%)', fontsize=11)
+        ax.set_ylim(-5, 110)
+        ax.set_title('High-Risk Probability Trend Forecast', fontweight='bold', fontsize=13)
+        ax.legend(fontsize=10)
+        ax.spines[['top','right']].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Plot 3: Monthly Seasonal Pattern ────────────────────
+        st.markdown("#### 🌡️ Seasonal Pattern — Average Cases by Calendar Month")
+        month_avg = ts.groupby('Month')['Malaria_Cases'].mean().reindex(range(1, 13))
+        month_names = ['Jan','Feb','Mar','Apr','May','Jun',
+                       'Jul','Aug','Sep','Oct','Nov','Dec']
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        bars = ax.bar(range(1, 13), month_avg.values,
+                      color=['#3B82F6' if v < month_avg.mean() else '#EF4444'
+                             for v in month_avg.values],
+                      edgecolor='white', alpha=0.9)
+        ax.axhline(month_avg.mean(), color='grey', lw=1.5,
+                   linestyle='--', label='Annual average')
+        ax.set_xticks(range(1, 13))
+        ax.set_xticklabels(month_names, fontsize=10)
+        ax.set_ylabel('Avg Malaria Cases', fontsize=11)
+        ax.set_title('Seasonal Pattern (Calendar Month)', fontweight='bold', fontsize=12)
+        ax.legend()
+        ax.spines[['top','right']].set_visible(False)
+        for bar, val in zip(bars, month_avg.values):
+            if not np.isnan(val):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                        f'{val:.0f}', ha='center', va='bottom', fontsize=8)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # ── Optional: Trend Decomposition ───────────────────────
+        if show_decomp and len(ts) >= 12:
+            st.markdown("#### 🔬 Trend Decomposition")
+            t_arr = ts['t'].values.astype(float)
+            y_arr = ts['Malaria_Cases'].values.astype(float)
+
+            # Linear trend
+            slope, intercept, r_val, p_val, _ = stats.linregress(t_arr, y_arr)
+            trend_line = slope * t_arr + intercept
+            seasonal   = y_arr - trend_line
+            residual   = y_arr - trend_line - seasonal
+
+            fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+            axes[0].plot(t_arr, y_arr,      color='#3B82F6', lw=2)
+            axes[0].plot(t_arr, trend_line, color='#EF4444', lw=1.5, linestyle='--', label='Trend')
+            axes[0].set_ylabel('Original');  axes[0].legend()
+            axes[0].set_title('Trend Decomposition — Malaria Cases', fontweight='bold')
+
+            axes[1].bar(t_arr, seasonal, color='#10B981', alpha=0.7)
+            axes[1].axhline(0, color='grey', lw=0.8)
+            axes[1].set_ylabel('Seasonal')
+
+            axes[2].plot(t_arr, residual, color='#F59E0B', lw=1.2)
+            axes[2].axhline(0, color='grey', lw=0.8)
+            axes[2].set_ylabel('Residual')
+            axes[2].set_xlabel('Time Step')
+
+            for ax in axes:
+                ax.spines[['top','right']].set_visible(False)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+            trend_dir = "📈 Upward" if slope > 0 else "📉 Downward"
+            st.info(
+                f"**Linear trend slope:** {slope:+.2f} cases/month  ·  "
+                f"**Direction:** {trend_dir}  ·  "
+                f"**R²:** {r_val**2:.3f}  ·  "
+                f"**p-value:** {p_val:.4f}"
+            )
+
+        # ── Forecast table ───────────────────────────────────────
+        st.markdown("#### 📋 Forecast Table")
+        if conf_int:
+            forecast_df['Cases_Lower_95'] = np.round(cas_lo, 1)
+            forecast_df['Cases_Upper_95'] = np.round(cas_hi, 1)
+            forecast_df['Risk_%_Lower_95'] = np.round(risk_lo * 100, 2)
+            forecast_df['Risk_%_Upper_95'] = np.round(risk_hi * 100, 2)
+
+        st.dataframe(
+            forecast_df.style.applymap(
+                lambda v: 'background-color: #fee2e2' if v == '🔴 High'
+                          else ('background-color: #dcfce7' if v == '🟢 Low' else ''),
+                subset=['Risk_Label']
+            ),
+            use_container_width=True
+        )
+
+        high_risk_months = int((risk_fut >= 0.5).sum())
+        st.info(
+            f"📊 **Forecast summary:** Over the next **{n_ahead} months**, "
+            f"**{high_risk_months}** months are predicted to be **high-risk** "
+            f"and **{n_ahead - high_risk_months}** months **low-risk**. "
+            f"Average forecasted cases: **{cas_fut.mean():.1f}** / month."
+        )
+
+        # ── Peak month warning ───────────────────────────────────
+        peak_idx  = np.argmax(cas_fut)
+        peak_month_names = ['Jan','Feb','Mar','Apr','May','Jun',
+                            'Jul','Aug','Sep','Oct','Nov','Dec']
+        peak_month_name = peak_month_names[months_fut[peak_idx] - 1]
+        st.warning(
+            f"⚠️ **Highest forecasted burden:** Month **{peak_idx + 1}** of the forecast "
+            f"(calendar month: **{peak_month_name}**) — "
+            f"predicted **{cas_fut[peak_idx]:.0f} cases** "
+            f"with **{risk_fut[peak_idx]*100:.1f}% high-risk probability**."
+        )
+
+
 # ════════════════════════════════════════════════════════════════
-# ── Section 2: Custom Training Experiment (dataset copy only) ───
+# ── Section 3: Custom Training Experiment (dataset copy only) ───
 # ════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.subheader("🧪 Custom Training Experiment")
@@ -404,13 +769,11 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
     st.markdown("##### Step 1 — Filter the dataset copy")
     fc1, fc2 = st.columns(2)
 
-    # Month range filter
     month_range = fc1.slider(
         "Include months", 1, 12, (1, 12),
         help="Keep only rows whose Month falls within this range"
     )
 
-    # Rainfall filter
     rain_min_val = float(X['Rainfall_mm'].min())
     rain_max_val = float(X['Rainfall_mm'].max())
     rain_range = fc2.slider(
@@ -429,7 +792,6 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
         (temp_min_val, temp_max_val)
     )
 
-    # Sample size
     max_rows = len(X)
     sample_pct = fc4.slider(
         "Use what % of filtered rows",
@@ -448,11 +810,9 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
     run_exp = st.button("▶️ Run Custom Experiment", type="primary")
 
     if run_exp:
-        # --- Work on a COPY of X and y, never df_raw ---
         X_exp = X.copy()
         y_exp = y.copy()
 
-        # Apply filters
         mask = (
             (X_exp['Month'] >= month_range[0]) & (X_exp['Month'] <= month_range[1]) &
             (X_exp['Rainfall_mm'] >= rain_range[0]) & (X_exp['Rainfall_mm'] <= rain_range[1]) &
@@ -461,7 +821,6 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
         X_exp = X_exp[mask]
         y_exp = y_exp[mask]
 
-        # Sample
         if sample_pct < 100:
             sample_n = max(int(len(X_exp) * sample_pct / 100), 10)
             idx = np.random.RandomState(42).choice(len(X_exp), sample_n, replace=False)
@@ -489,7 +848,6 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
             Xtr_e_sc = sc_e.fit_transform(Xtr_e)
             Xte_e_sc = sc_e.transform(Xte_e)
 
-            # Train chosen model (no grid search to keep it fast)
             if exp_model_name == "Logistic Regression":
                 m_exp = LogisticRegression(max_iter=1000, random_state=42)
                 m_exp.fit(Xtr_e_sc, ytr_e)
@@ -506,7 +864,6 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
                 yp_e  = m_exp.predict(Xte_e)
                 ypr_e = m_exp.predict_proba(Xte_e)[:, 1]
 
-            # Metrics
             exp_metrics = {
                 'Accuracy':  round(accuracy_score(yte_e, yp_e), 4),
                 'Precision': round(precision_score(yte_e, yp_e, zero_division=0), 4),
@@ -518,15 +875,12 @@ with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
             st.markdown(f"#### 📊 Results — {exp_model_name} (Custom Experiment)")
             ec1, ec2, ec3, ec4, ec5 = st.columns(5)
             for col, (metric, val) in zip([ec1,ec2,ec3,ec4,ec5], exp_metrics.items()):
-
-                # Compare against the same model trained on full data (if available)
                 delta_str = None
                 if exp_model_name in results:
                     delta_val = val - results[exp_model_name][metric]
                     delta_str = f"{delta_val:+.4f} vs full data"
                 col.metric(metric, f"{val:.4f}", delta_str)
 
-            # Side-by-side confusion matrix vs full-data model
             if exp_model_name in results:
                 st.markdown("##### Confusion Matrix Comparison")
                 cm_cols = st.columns(2)
