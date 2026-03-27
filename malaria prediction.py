@@ -61,7 +61,7 @@ def load_data(path: str) -> pd.DataFrame:
     print()
     return df
 
-df = load_data(DATA_PATH)
+df = load_data("Final_Malaria_Dataset.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  DATA PRE-PROCESSING & CLEANING
