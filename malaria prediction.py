@@ -1,12 +1,8 @@
-# ================================
-# MALARIA PREDICTION MODEL
-# ================================
-
-# 1. Import Libraries
+import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -15,166 +11,142 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score
+import joblib
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# ================================
-# 2. Load Dataset
-# ================================
-df = pd.read_csv("Final_Malaria_Dataset.csv")
+st.title("🦟 Malaria Prediction System")
 
-print("Dataset Shape:", df.shape)
-print(df.head())
+st.write("Train models and predict malaria outbreak risk")
 
-# ================================
-# 3. Data Cleaning
-# ================================
+# ===============================
+# SIDEBAR SETTINGS
+# ===============================
 
-# Remove unnecessary columns
-df = df.drop(columns=['ID','Notes','Disease_Cases','Avg_Income'], errors='ignore')
+st.sidebar.header("Model Settings")
 
-# Drop rows where target is missing
-df = df.dropna(subset=['High_Risk_Binary'])
+dataset_file = st.sidebar.file_uploader("Upload Dataset (CSV)")
 
-# Fill missing numerical values with median
-num_cols = df.select_dtypes(include=['int64','float64']).columns
-df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+train_button = st.sidebar.button("Train Models")
 
-# ================================
-# 4. Feature Selection
-# ================================
 
-X = df.drop(columns=['High_Risk_Binary'])
-y = df['High_Risk_Binary']
+# ===============================
+# MODEL TRAINING
+# ===============================
 
-categorical_cols = ['Region','County','Month']
-numerical_cols = [col for col in X.columns if col not in categorical_cols]
+if dataset_file is not None:
 
-# ================================
-# 5. Preprocessing Pipeline
-# ================================
+    df = pd.read_csv(dataset_file)
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', StandardScaler(), numerical_cols),
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)
-    ]
-)
+    st.subheader("Dataset Preview")
+    st.write(df.head())
 
-# ================================
-# 6. Train Test Split
-# ================================
+    if train_button:
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42, stratify=y
-)
+        st.write("Training models...")
 
-# ================================
-# 7. Models
-# ================================
+        target = "High_Risk_Binary"
 
-models = {
+        X = df.drop(columns=[target])
+        y = df[target]
 
-"Logistic Regression": Pipeline([
-    ('prep', preprocessor),
-    ('model', LogisticRegression(max_iter=1000))
-]),
+        categorical_cols = X.select_dtypes(include=["object"]).columns
+        numerical_cols = X.select_dtypes(exclude=["object"]).columns
 
-"Random Forest": Pipeline([
-    ('prep', preprocessor),
-    ('model', RandomForestClassifier(n_estimators=200, random_state=42))
-]),
+        preprocessor = ColumnTransformer([
+            ("num", StandardScaler(), numerical_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols)
+        ])
 
-"XGBoost": Pipeline([
-    ('prep', preprocessor),
-    ('model', XGBClassifier(
-        n_estimators=300,
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric='logloss'
-    ))
-])
+        models = {
 
-}
+            "Logistic Regression": LogisticRegression(max_iter=1000),
 
-# ================================
-# 8. Train Models
-# ================================
+            "Random Forest": RandomForestClassifier(n_estimators=200),
 
-results = {}
+            "XGBoost": XGBClassifier(
+                n_estimators=300,
+                learning_rate=0.05,
+                max_depth=6,
+                eval_metric="logloss"
+            )
+        }
 
-for name, model in models.items():
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
 
-    model.fit(X_train, y_train)
+        best_acc = 0
+        best_model = None
+        best_name = ""
 
-    preds = model.predict(X_test)
+        for name, model in models.items():
 
-    acc = accuracy_score(y_test, preds)
-    prec = precision_score(y_test, preds)
-    rec = recall_score(y_test, preds)
-    f1 = f1_score(y_test, preds)
+            pipe = Pipeline([
+                ("prep", preprocessor),
+                ("model", model)
+            ])
 
-    results[name] = [acc, prec, rec, f1]
+            pipe.fit(X_train, y_train)
 
-    print("\n====================")
-    print(name)
-    print("====================")
-    print(classification_report(y_test, preds))
+            preds = pipe.predict(X_test)
 
-# ================================
-# 9. Compare Models
-# ================================
+            acc = accuracy_score(y_test, preds)
 
-results_df = pd.DataFrame(results,
-                          index=['Accuracy','Precision','Recall','F1']).T
+            st.write(f"{name} Accuracy:", acc)
 
-print("\nModel Comparison")
-print(results_df)
+            if acc > best_acc:
+                best_acc = acc
+                best_model = pipe
+                best_name = name
 
-results_df.plot(kind='bar', figsize=(10,5))
-plt.title("Model Performance Comparison")
-plt.ylabel("Score")
-plt.show()
+        st.success(f"Best Model: {best_name} (Accuracy {best_acc:.2f})")
 
-# ================================
-# 10. Best Model
-# ================================
+        joblib.dump(best_model, "malaria_model.pkl")
 
-best_model_name = results_df['Accuracy'].idxmax()
-print("\nBest Model:", best_model_name)
+        st.success("Model saved successfully")
 
-best_model = models[best_model_name]
 
-# ================================
-# 11. Confusion Matrix
-# ================================
+# ===============================
+# PREDICTION SECTION
+# ===============================
 
-preds = best_model.predict(X_test)
+st.header("Predict Malaria Risk")
 
-cm = confusion_matrix(y_test, preds)
+try:
+    model = joblib.load("malaria_model.pkl")
 
-plt.figure(figsize=(6,4))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
-plt.title("Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-plt.show()
+    region = st.selectbox("Region", ["Nyanza","Rift Valley","Central"])
 
-# ================================
-# 12. Feature Importance (RF/XGB)
-# ================================
+    rainfall = st.slider("Rainfall (mm)",0,500,120)
 
-if best_model_name != "Logistic Regression":
+    temperature = st.slider("Temperature (°C)",10,40,26)
 
-    model = best_model.named_steps['model']
+    humidity = st.slider("Humidity (%)",0,100,75)
 
-    importances = model.feature_importances_
+    month = st.selectbox("Month",
+                         ["Jan","Feb","Mar","Apr","May","Jun",
+                          "Jul","Aug","Sep","Oct","Nov","Dec"])
 
-    plt.figure(figsize=(8,5))
-    plt.bar(range(len(importances)), importances)
-    plt.title("Feature Importance")
-    plt.show()
+    input_df = pd.DataFrame({
+        "Region":[region],
+        "Rainfall":[rainfall],
+        "Temperature":[temperature],
+        "Humidity":[humidity],
+        "Month":[month]
+    })
+
+    st.write("Input Data")
+    st.write(input_df)
+
+    if st.button("Predict"):
+
+        prediction = model.predict(input_df)
+
+        if prediction[0] == 1:
+            st.error("⚠ High Malaria Risk Predicted")
+        else:
+            st.success("✅ Low Malaria Risk")
+
+except:
+    st.warning("Please train the model first using the sidebar.")
