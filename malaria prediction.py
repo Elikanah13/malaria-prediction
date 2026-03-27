@@ -25,7 +25,7 @@ st.write("Train models and predict malaria outbreak risk")
 
 st.sidebar.header("Model Settings")
 
-dataset_file = st.sidebar.file_uploader("Upload Dataset (CSV)")
+dataset_file = st.sidebar.file_uploader()"C:\Users\Elly\OneDrive\Desktop\datasets\Final_Malaria_Dataset.csv"
 
 train_button = st.sidebar.button("Train Models")
 
