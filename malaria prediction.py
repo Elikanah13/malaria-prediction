@@ -14,9 +14,7 @@ from xgboost import XGBClassifier
 from sklearn.metrics import accuracy_score
 import joblib
 
-
 st.title("🦟 Malaria Prediction System")
-
 st.write("Train models and predict malaria outbreak risk")
 
 # ===============================
@@ -25,10 +23,12 @@ st.write("Train models and predict malaria outbreak risk")
 
 st.sidebar.header("Model Settings")
 
-dataset_file = st.sidebar.file_uploader("C:\Users\Elly\OneDrive\Desktop\datasets\Final_Malaria_Dataset.csv")
+dataset_file = st.sidebar.file_uploader(
+    "Upload Malaria Dataset", 
+    type=["csv"]
+)
 
 train_button = st.sidebar.button("Train Models")
-
 
 # ===============================
 # MODEL TRAINING
@@ -93,19 +93,18 @@ if dataset_file is not None:
 
             acc = accuracy_score(y_test, preds)
 
-            st.write(f"{name} Accuracy:", acc)
+            st.write(f"{name} Accuracy: {acc:.3f}")
 
             if acc > best_acc:
                 best_acc = acc
                 best_model = pipe
                 best_name = name
 
-        st.success(f"Best Model: {best_name} (Accuracy {best_acc:.2f})")
+        st.success(f"Best Model: {best_name} (Accuracy {best_acc:.3f})")
 
         joblib.dump(best_model, "malaria_model.pkl")
 
         st.success("Model saved successfully")
-
 
 # ===============================
 # PREDICTION SECTION
@@ -118,15 +117,17 @@ try:
 
     region = st.selectbox("Region", ["Nyanza","Rift Valley","Central"])
 
-    rainfall = st.slider("Rainfall (mm)",0,500,120)
+    rainfall = st.slider("Rainfall (mm)", 0, 500, 120)
 
-    temperature = st.slider("Temperature (°C)",10,40,26)
+    temperature = st.slider("Temperature (°C)", 10, 40, 26)
 
-    humidity = st.slider("Humidity (%)",0,100,75)
+    humidity = st.slider("Humidity (%)", 0, 100, 75)
 
-    month = st.selectbox("Month",
-                         ["Jan","Feb","Mar","Apr","May","Jun",
-                          "Jul","Aug","Sep","Oct","Nov","Dec"])
+    month = st.selectbox(
+        "Month",
+        ["Jan","Feb","Mar","Apr","May","Jun",
+         "Jul","Aug","Sep","Oct","Nov","Dec"]
+    )
 
     input_df = pd.DataFrame({
         "Region":[region],
