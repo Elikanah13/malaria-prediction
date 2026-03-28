@@ -677,7 +677,7 @@ if run_forecast:
             forecast_df['Risk_%_Upper_95']  = np.round(risk_hi * 100, 2)
 
         st.dataframe(
-            forecast_df.style.applymap(
+            forecast_df.style.map(
                 lambda v: 'background-color: #fee2e2' if v == '🔴 High'
                           else ('background-color: #dcfce7' if v == '🟢 Low' else ''),
                 subset=['Risk_Label']
