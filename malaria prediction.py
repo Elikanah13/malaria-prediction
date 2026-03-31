@@ -469,9 +469,11 @@ if submitted:
             pred  = model.predict(inp)[0]
             prob  = model.predict_proba(inp)[0][1]
             label = "🔴 HIGH RISK" if pred == 1 else "🟢 LOW RISK"
-            pred_cols[i].metric(name, label, f"Confidence: {prob*100:.1f}%")
+            pred_cols[i].metric(label=name,value=label,delta=f"{prob*100:.1f}%
+            probability"
+                               )
         except Exception as err:
-            pred_cols[i].error(f"{name}: {err}")
+            pred_cols[i].error(f"prediction failed: {err}")
 
     with st.expander("📋 View input summary"):
         st.dataframe(pd.DataFrame({
