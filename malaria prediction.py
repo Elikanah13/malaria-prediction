@@ -1,930 +1,963 @@
-"""
-Malaria Infection Prediction App  –  FIXED VERSION
-Models: Logistic Regression | Random Forest | Gradient Boosting
-+ Future Trend Forecasting (Cases & High-Risk Probability)
-
-KEY FIXES APPLIED
-─────────────────
-1. Removed duplicate get_season() definition (was defined twice)
-2. style.applymap → style.map compatibility guard (pandas 1.x vs 2.x)
-3. roc_auc_score wrapped in try/except (crashes on single-class y_test)
-4. Unique key= on every st.button / st.slider / st.selectbox to avoid
-   DuplicateWidgetID errors on reruns
-5. build_time_series / build_forecast_features unhashed correctly;
-   removed @st.cache_data from inner helpers that receive DataFrames
-   containing non-hashable dtypes
-6. GridSearchCV failures caught; app falls back to default hyperparams
-7. Custom-experiment sliders given distinct key names so they don't
-   collide with the main-training sliders
-8. hint() / X reference guard in case X is not yet in scope
-9. Forecast block now only runs when ts has sufficient rows (guard
-   moved earlier)
-10. summary_df column check before idxmax() to avoid empty-DataFrame crash
-"""
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings('ignore')
-
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import (RandomForestClassifier,
-                               GradientBoostingClassifier,
-                               GradientBoostingRegressor)
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, confusion_matrix, roc_auc_score, roc_curve,
-    mean_absolute_error, mean_squared_error,
-)
-from scipy import stats
-
-# ── Page config ───────────────────────────────────────────────
-st.set_page_config(
-    page_title="Malaria Prediction | Group 3",
-    page_icon="🦟",
-    layout="wide",
-)
-
-st.title("🦟 Malaria Infection Prediction")
-st.markdown("*Group 3 · Meru University of Science and Technology · BSc Data Science*")
-st.markdown("---")
-
-# ── Session-state defaults ────────────────────────────────────
-for _k in ['results', 'scaler', 'y_test', 'models_sel',
-           'X', 'y', 'FEATURES', 'df_processed']:
-    if _k not in st.session_state:
-        st.session_state[_k] = None
-
-# ── Helper: season label (defined ONCE at module level) ───────
-def get_season(m: int) -> str:
-    m = int(m)
-    if m in [3, 4, 5]:      return 'Long_Rains'
-    elif m in [6, 7, 8]:    return 'Dry'
-    elif m in [9, 10, 11]:  return 'Short_Rains'
-    else:                    return 'Cool_Dry'
-
-SEASON_MAP = {'Cool_Dry': 0, 'Dry': 1, 'Long_Rains': 2, 'Short_Rains': 3}
-COLORS     = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444']
-
-# ── Sidebar — upload ──────────────────────────────────────────
-st.sidebar.header("📂 Dataset")
-uploaded = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"])
-
-@st.cache_data
-def load_data(file):
-    return pd.read_csv(file)
-
-if uploaded:
-    df_raw = load_data(uploaded)
-else:
-    st.info("📁 Please upload *Final_Malaria_Dataset.csv* in the sidebar to begin.")
-    st.stop()
-
-st.subheader("📋 Raw Data Preview")
-st.dataframe(df_raw.head(10), use_container_width=True)
-st.markdown(f"*Shape:* {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
-
-# ── Pre-processing ────────────────────────────────────────────
-@st.cache_data
-def preprocess(df: pd.DataFrame):
-    df = df.copy()
-
-    drop_cols = ['ID', 'Health_Facilities', 'Avg_Income', 'Disease_Cases', 'Notes']
-    df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
-    df.drop_duplicates(inplace=True)
-
-    if 'Region' in df.columns:
-        df['Region'] = df['Region'].str.strip().str.title()
-    if 'County' in df.columns:
-        df['County'] = df['County'].str.strip().str.title()
-
-    num_cols = df.select_dtypes(include=np.number).columns.tolist()
-    imp = SimpleImputer(strategy='median')
-    df[num_cols] = imp.fit_transform(df[num_cols])
-
-    cap_cols = ['Rainfall_mm', 'Temperature_C', 'Humidity_percent',
-                'Malaria_Cases', 'Lag_1_Month_Cases', 'Incidence_per_100k']
-    for col in cap_cols:
-        if col in df.columns:
-            Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            df[col] = df[col].clip(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
-
-    df['Season'] = df['Month'].apply(get_season)
-    df['Cases_Per_Capita'] = df['Malaria_Cases'] / df['Population'].replace(0, np.nan) * 100_000
-    df['Cases_Per_Capita'].fillna(0, inplace=True)
-
-    le_r = LabelEncoder(); le_c = LabelEncoder(); le_s = LabelEncoder()
-    df['Region_enc'] = le_r.fit_transform(df['Region'].astype(str))
-    df['County_enc'] = le_c.fit_transform(df['County'].astype(str))
-    df['Season_enc'] = le_s.fit_transform(df['Season'].astype(str))
-
-    FEATURES = ['Rainfall_mm', 'Temperature_C', 'Humidity_percent',
-                'Lag_1_Month_Cases', 'Incidence_per_100k', 'Month',
-                'Population', 'Malaria_Cases', 'Cases_Per_Capita',
-                'Region_enc', 'County_enc', 'Season_enc']
-    TARGET = 'High_Risk_Binary'
-
-    # Drop features that don't exist in the uploaded file
-    FEATURES = [f for f in FEATURES if f in df.columns]
-
-    X = df[FEATURES]
-    y = df[TARGET].astype(int)
-    return X, y, FEATURES, df
-
-
-try:
-    X, y, FEATURES, df_processed = preprocess(df_raw)
-except Exception as e:
-    st.error(f"❌ Pre-processing failed: {e}\n\nPlease check that your CSV has the required columns.")
-    st.stop()
-
-st.session_state['X']            = X
-st.session_state['y']            = y
-st.session_state['FEATURES']     = FEATURES
-st.session_state['df_processed'] = df_processed
-
-# ── Data stats ────────────────────────────────────────────────
-st.subheader("📊 Dataset Statistics")
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Records", len(X))
-col2.metric("Low Risk (0)",  int((y == 0).sum()))
-col3.metric("High Risk (1)", int((y == 1).sum()))
-
-with st.expander("Show feature summary"):
-    st.dataframe(X.describe().round(2), use_container_width=True)
-
-# ── Sidebar — model options ───────────────────────────────────
-st.sidebar.header("⚙️ Model Settings")
-test_size  = st.sidebar.slider("Test split %", 10, 40, 20, key="main_test_size") / 100
-run_tuning = st.sidebar.checkbox("Enable hyperparameter tuning (GridSearchCV)", value=True)
-models_sel = st.sidebar.multiselect(
-    "Models to train",
-    ["Logistic Regression", "Random Forest", "Gradient Boosting"],
-    default=["Logistic Regression", "Random Forest", "Gradient Boosting"],
-)
-
-if not models_sel:
-    st.warning("Please select at least one model.")
-    st.stop()
-
-run_btn = st.sidebar.button("🚀 Train Models", type="primary", key="train_btn")
-
-# ── Training ──────────────────────────────────────────────────
-if run_btn:
-    st.subheader("🔧 Model Training")
-
-    # Guard: need at least 2 classes and enough rows
-    if y.nunique() < 2:
-        st.error("Target column has only one class — cannot train classifiers.")
-        st.stop()
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=42, stratify=y
-    )
-
-    scaler      = StandardScaler()
-    X_train_sc  = scaler.fit_transform(X_train)
-    X_test_sc   = scaler.transform(X_test)
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    def get_model(name, tuning):
-        """Return (fitted_model, best_params, X_test_to_use)."""
-        if name == "Logistic Regression":
-            base = LogisticRegression(max_iter=1000, random_state=42)
-            if tuning:
-                try:
-                    gs = GridSearchCV(base,
-                        {'C': [0.01, 0.1, 1, 10],
-                         'solver': ['lbfgs', 'liblinear']},
-                        cv=cv, scoring='f1', n_jobs=-1)
-                    gs.fit(X_train_sc, y_train)
-                    return gs.best_estimator_, gs.best_params_, X_test_sc
-                except Exception:
-                    pass
-            base.fit(X_train_sc, y_train)
-            return base, {}, X_test_sc
-
-        elif name == "Random Forest":
-            base = RandomForestClassifier(random_state=42)
-            if tuning:
-                try:
-                    gs = GridSearchCV(base,
-                        {'n_estimators': [100, 200],
-                         'max_depth': [5, 10, None],
-                         'min_samples_split': [2, 5]},
-                        cv=cv, scoring='f1', n_jobs=-1)
-                    gs.fit(X_train, y_train)
-                    return gs.best_estimator_, gs.best_params_, X_test
-                except Exception:
-                    pass
-            base.fit(X_train, y_train)
-            return base, {}, X_test
-
-        else:  # Gradient Boosting
-            base = GradientBoostingClassifier(random_state=42)
-            if tuning:
-                try:
-                    gs = GridSearchCV(base,
-                        {'n_estimators': [100, 200],
-                         'learning_rate': [0.05, 0.1],
-                         'max_depth': [3, 5]},
-                        cv=cv, scoring='f1', n_jobs=-1)
-                    gs.fit(X_train, y_train)
-                    return gs.best_estimator_, gs.best_params_, X_test
-                except Exception:
-                    pass
-            base.fit(X_train, y_train)
-            return base, {}, X_test
-
-    results  = {}
-    progress = st.progress(0)
-    status   = st.empty()
-
-    for i, name in enumerate(models_sel):
-        status.text(f"Training {name}…")
-        try:
-            model, params, Xte = get_model(name, run_tuning)
-            y_pred = model.predict(Xte)
-            y_prob = model.predict_proba(Xte)[:, 1]
-
-            # roc_auc_score crashes when y_test has only one class
-            try:
-                auc = round(roc_auc_score(y_test, y_prob), 4)
-            except ValueError:
-                auc = float('nan')
-
-            results[name] = {
-                'model':     model,
-                'params':    params,
-                'Accuracy':  round(accuracy_score(y_test, y_pred), 4),
-                'Precision': round(precision_score(y_test, y_pred, zero_division=0), 4),
-                'Recall':    round(recall_score(y_test, y_pred, zero_division=0), 4),
-                'F1 Score':  round(f1_score(y_test, y_pred, zero_division=0), 4),
-                'ROC-AUC':   auc,
-                'y_pred':    y_pred,
-                'y_prob':    y_prob,
-                'cm':        confusion_matrix(y_test, y_pred),
-            }
-        except Exception as err:
-            st.warning(f"⚠️ {name} failed: {err}")
-
-        progress.progress((i + 1) / len(models_sel))
-
-    status.success("✅ All models trained!")
-
-    st.session_state['results']    = results
-    st.session_state['scaler']     = scaler
-    st.session_state['y_test']     = y_test
-    st.session_state['models_sel'] = models_sel
-
-# ── Gate: nothing to show if not trained yet ──────────────────
-if st.session_state['results'] is None:
-    st.info("Configure settings in the sidebar and click **🚀 Train Models** to begin.")
-    st.stop()
-
-results    = st.session_state['results']
-scaler     = st.session_state['scaler']
-y_test     = st.session_state['y_test']
-models_sel = st.session_state['models_sel']
-
-if not results:
-    st.error("No models were trained successfully. Check your dataset and try again.")
-    st.stop()
-
-# ── Results table ─────────────────────────────────────────────
-st.subheader("📈 Performance Summary")
-
-metric_cols = ['Accuracy', 'Precision', 'Recall', 'F1 Score', 'ROC-AUC']
-summary_df  = pd.DataFrame(
-    {name: {m: results[name][m] for m in metric_cols} for name in results}
-).T
-
-# highlight_max only on numeric columns (ROC-AUC may be NaN)
-numeric_summary = summary_df.select_dtypes(include='number')
-st.dataframe(
-    summary_df.style.highlight_max(axis=0, color='#d4edda',
-                                   subset=numeric_summary.columns.tolist()),
-    use_container_width=True,
-)
-
-if not summary_df.empty and 'F1 Score' in summary_df.columns:
-    best_model = summary_df['F1 Score'].idxmax()
-    st.success(f"🏆 **Best Model: {best_model}** — F1 Score = {summary_df.loc[best_model,'F1 Score']:.4f}")
-
-if run_tuning:
-    with st.expander("Best Hyperparameters"):
-        for name in results:
-            st.write(f"**{name}:** {results[name]['params']}")
-
-# ── Charts ────────────────────────────────────────────────────
-st.subheader("📊 Visualisations")
-tab1, tab2, tab3 = st.tabs(["Metric Comparison", "Confusion Matrices", "ROC Curves"])
-
-with tab1:
-    fig, ax = plt.subplots(figsize=(10, 5))
-    trained_names = list(results.keys())
-    x      = np.arange(len(metric_cols))
-    width  = 0.8 / max(len(trained_names), 1)
-    for i, name in enumerate(trained_names):
-        vals = [results[name][m] for m in metric_cols]
-        bars = ax.bar(x + i * width - (len(trained_names) - 1) * width / 2,
-                      vals, width, label=name, color=COLORS[i % len(COLORS)],
-                      alpha=0.85, edgecolor='white')
-        for bar, val in zip(bars, vals):
-            if not (isinstance(val, float) and np.isnan(val)):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
-                        f'{val:.3f}', ha='center', va='bottom', fontsize=8)
-    ax.set_xticks(x)
-    ax.set_xticklabels(metric_cols, fontsize=11)
-    ax.set_ylim(0, 1.15)
-    ax.set_ylabel('Score')
-    ax.set_title('Model Performance Comparison', fontweight='bold')
-    ax.legend()
-    ax.spines[['top', 'right']].set_visible(False)
-    st.pyplot(fig)
-    plt.close()
-
-with tab2:
-    cols = st.columns(max(len(results), 1))
-    for i, name in enumerate(results):
-        cm = results[name]['cm']
-        fig, ax = plt.subplots(figsize=(4, 3.5))
-        im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
-        plt.colorbar(im, ax=ax)
-        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-        ax.set_xticklabels(['Low Risk', 'High Risk'], rotation=30, fontsize=9)
-        ax.set_yticklabels(['Low Risk', 'High Risk'], fontsize=9)
-        thresh = cm.max() / 2
-        for r in range(2):
-            for c in range(2):
-                ax.text(c, r, str(cm[r, c]), ha='center', va='center',
-                        color='white' if cm[r, c] > thresh else 'black',
-                        fontsize=14, fontweight='bold')
-        ax.set_ylabel('Actual', fontsize=10)
-        ax.set_xlabel('Predicted', fontsize=10)
-        ax.set_title(name, fontweight='bold', fontsize=11)
-        plt.tight_layout()
-        cols[i].pyplot(fig)
-        plt.close()
-
-with tab3:
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for i, name in enumerate(results):
-        auc = results[name]['ROC-AUC']
-        if np.isnan(auc):
-            continue
-        fpr, tpr, _ = roc_curve(y_test, results[name]['y_prob'])
-        ax.plot(fpr, tpr, lw=2.2, color=COLORS[i % len(COLORS)],
-                label=f'{name} (AUC={auc:.3f})')
-    ax.plot([0, 1], [0, 1], 'k--', lw=1, alpha=0.5, label='Random Classifier')
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ROC Curves', fontweight='bold', fontsize=13)
-    ax.legend(fontsize=10)
-    ax.spines[['top', 'right']].set_visible(False)
-    st.pyplot(fig)
-    plt.close()
-
-# ── Feature importance ────────────────────────────────────────
-if 'Random Forest' in results:
-    st.subheader("🌲 Feature Importance (Random Forest)")
-    fi = pd.Series(
-        results['Random Forest']['model'].feature_importances_,
-        index=FEATURES,
-    ).sort_values(ascending=True)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.barh(fi.index, fi.values, color='#10B981', alpha=0.85, edgecolor='white')
-    ax.set_xlabel('Importance Score')
-    ax.set_title('Random Forest — Feature Importance', fontweight='bold')
-    ax.spines[['top', 'right']].set_visible(False)
-    st.pyplot(fig)
-    plt.close()
-
-
-# ══════════════════════════════════════════════════════════════
-# Section 1 — Predict a New Case
-# ══════════════════════════════════════════════════════════════
-st.markdown("---")
-st.subheader("🔮 Predict a New Case")
-st.markdown("Enter any values below. The dataset range is shown as a hint in each field.")
-
-def hint(col: str) -> str:
-    """Return dataset range hint for a column, safely."""
-    try:
-        lo = float(X[col].min())
-        hi = float(X[col].max())
-        return f"Dataset range: {lo:.1f} – {hi:.1f}"
-    except Exception:
-        return ""
-
-with st.form("predict_form"):
-    st.markdown("##### 🌦️ Climate Inputs")
-    p1, p2, p3 = st.columns(3)
-    rainfall    = p1.number_input("Rainfall (mm)",     value=100.0, step=0.1, help=hint('Rainfall_mm'))
-    temperature = p2.number_input("Temperature (°C)",  value=25.0,  step=0.1, help=hint('Temperature_C'))
-    humidity    = p3.number_input("Humidity (%)",       value=65.0,  step=0.1, help=hint('Humidity_percent'))
-
-    st.markdown("##### 🦟 Case & Population Inputs")
-    p4, p5, p6 = st.columns(3)
-    lag_cases  = p4.number_input("Lag 1 Month Cases",  value=500.0, step=1.0,  help=hint('Lag_1_Month_Cases'))
-    incidence  = p5.number_input("Incidence per 100k", value=100.0, step=0.1,  help=hint('Incidence_per_100k'))
-    month      = p6.number_input("Month (1–12)",        value=6,     step=1,
-                                  min_value=1, max_value=12)
-
-    p7, p8 = st.columns(2)
-    population = p7.number_input("Population",    value=500_000, step=1_000, help=hint('Population'))
-    mal_cases  = p8.number_input("Malaria Cases", value=500.0,   step=1.0,   help=hint('Malaria_Cases'))
-
-    submitted = st.form_submit_button("🔍 Predict Risk", type="primary")
-
-if submitted:
-    cases_pc   = mal_cases / max(population, 1) * 100_000
-    season_enc = SEASON_MAP.get(get_season(int(month)), 0)
-
-    input_df = pd.DataFrame([[
-        rainfall, temperature, humidity, lag_cases, incidence,
-        month, population, mal_cases, cases_pc, 0, 0, season_enc,
-    ]], columns=['Rainfall_mm', 'Temperature_C', 'Humidity_percent',
-                 'Lag_1_Month_Cases', 'Incidence_per_100k', 'Month',
-                 'Population', 'Malaria_Cases', 'Cases_Per_Capita',
-                 'Region_enc', 'County_enc', 'Season_enc'])
-
-    # Keep only columns that were used during training
-    input_df = input_df[FEATURES]
-
-    st.markdown("### 🎯 Prediction Results")
-    pred_cols = st.columns(max(len(results), 1))
-
-    for i, name in enumerate(results):
-        inp   = scaler.transform(input_df) if name == "Logistic Regression" else input_df
-        model = results[name]['model']
-        try:
-            pred  = model.predict(inp)[0]
-            prob  = model.predict_proba(inp)[0][1]
-            label = "🔴 HIGH RISK" if pred == 1 else "🟢 LOW RISK"
-            pred_cols[i].metric(label=name,value=label,delta=f"{prob*100:.1f}%
-            probability"
-                               )
-        except Exception as err:
-            pred_cols[i].error(f"prediction failed: {err}")
-
-    with st.expander("📋 View input summary"):
-        st.dataframe(pd.DataFrame({
-            'Feature': ['Rainfall (mm)', 'Temperature (°C)', 'Humidity (%)',
-                        'Lag 1 Month Cases', 'Incidence per 100k', 'Month',
-                        'Population', 'Malaria Cases', 'Cases per Capita', 'Season'],
-            'Value':   [rainfall, temperature, humidity, lag_cases, incidence,
-                        month, population, mal_cases, round(cases_pc, 2),
-                        get_season(int(month))],
-        }), use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════
-# Section 2 — Future Trend Prediction
-# ══════════════════════════════════════════════════════════════
-st.markdown("---")
-st.subheader("📅 Future Trend Prediction")
-st.markdown(
-    "Forecast *malaria cases* and *high-risk probability* for upcoming months "
-    "using time-series regression trained on your historical data."
-)
-
-# NOTE: these helpers are NOT decorated with @st.cache_data because
-# the DataFrames they receive can contain dtypes that are not hashable
-# across reruns, causing silent cache misses or crashes.
-def build_time_series(df: pd.DataFrame):
-    d        = df.copy()
-    has_year = 'Year' in d.columns
-    if has_year:
-        d['time_idx'] = (d['Year'] - d['Year'].min()) * 12 + (d['Month'] - 1)
-        ts = (d.groupby('time_idx')
-               .agg(
-                   Malaria_Cases  =('Malaria_Cases',      'mean'),
-                   Incidence      =('Incidence_per_100k', 'mean'),
-                   Rainfall       =('Rainfall_mm',        'mean'),
-                   Temperature    =('Temperature_C',      'mean'),
-                   Humidity       =('Humidity_percent',   'mean'),
-                   High_Risk_Rate =('High_Risk_Binary',   'mean'),
-                   Month          =('Month',              'first'),
-               )
-               .reset_index())
-    else:
-        ts = (d.groupby('Month')
-               .agg(
-                   Malaria_Cases  =('Malaria_Cases',      'mean'),
-                   Incidence      =('Incidence_per_100k', 'mean'),
-                   Rainfall       =('Rainfall_mm',        'mean'),
-                   Temperature    =('Temperature_C',      'mean'),
-                   Humidity       =('Humidity_percent',   'mean'),
-                   High_Risk_Rate =('High_Risk_Binary',   'mean'),
-               )
-               .reset_index()
-               .rename(columns={'Month': 'time_idx'}))
-        ts['Month'] = ts['time_idx']
-
-    ts = ts.sort_values('time_idx').reset_index(drop=True)
-    ts['t'] = np.arange(len(ts))
-    return ts, has_year
-
-
-def build_forecast_features(ts: pd.DataFrame) -> np.ndarray:
-    t      = ts['t'].values
-    month  = ts['Month'].values
-    sin1   = np.sin(2 * np.pi * month / 12)
-    cos1   = np.cos(2 * np.pi * month / 12)
-    sin2   = np.sin(4 * np.pi * month / 12)
-    cos2   = np.cos(4 * np.pi * month / 12)
-    return np.column_stack([
-        t, t**2, sin1, cos1, sin2, cos2,
-        ts['Rainfall'].values, ts['Temperature'].values, ts['Humidity'].values,
-    ])
-
-
-def make_future_feats(ts: pd.DataFrame, n_ahead: int):
-    t_last     = ts['t'].max()
-    t_fut      = np.arange(t_last + 1, t_last + 1 + n_ahead)
-    last_month = int(ts['Month'].iloc[-1])
-    months_fut = np.array([(last_month + i - 1) % 12 + 1 for i in range(1, n_ahead + 1)])
-    sin1  = np.sin(2 * np.pi * months_fut / 12)
-    cos1  = np.cos(2 * np.pi * months_fut / 12)
-    sin2  = np.sin(4 * np.pi * months_fut / 12)
-    cos2  = np.cos(4 * np.pi * months_fut / 12)
-    window = min(12, len(ts))
-    rain_f = np.full(n_ahead, ts['Rainfall'].iloc[-window:].mean())
-    temp_f = np.full(n_ahead, ts['Temperature'].iloc[-window:].mean())
-    hum_f  = np.full(n_ahead, ts['Humidity'].iloc[-window:].mean())
-    feats  = np.column_stack([t_fut, t_fut**2, sin1, cos1, sin2, cos2,
-                               rain_f, temp_f, hum_f])
-    return feats, months_fut
-
-
-ts, has_year = build_time_series(df_processed)
-
-with st.expander("📊 Historical Monthly Aggregated Data", expanded=False):
-    st.dataframe(ts.round(2), use_container_width=True)
-    st.caption(
-        f"{'Year × Month' if has_year else 'Month-only'} aggregation · {len(ts)} time steps"
-    )
-
-st.markdown("#### ⚙️ Forecast Settings")
-fc_col1, fc_col2, fc_col3 = st.columns(3)
-n_ahead     = fc_col1.slider("Months to forecast ahead", 3, 24, 12, key="forecast_n_ahead")
-conf_int    = fc_col2.checkbox("Show 95% confidence band", value=True, key="forecast_conf")
-show_decomp = fc_col3.checkbox("Show trend decomposition",  value=False, key="forecast_decomp")
-
-run_forecast = st.button("📈 Generate Forecast", type="primary", key="forecast_btn")
-
-if run_forecast:
-    if len(ts) < 6:
-        st.error("⚠️ Need at least 6 time steps in the dataset to build a reliable forecast.")
-    else:
-        X_ts   = build_forecast_features(ts)
-        y_cas  = ts['Malaria_Cases'].values
-        y_risk = ts['High_Risk_Rate'].values
-
-        gb_cas = GradientBoostingRegressor(n_estimators=200, max_depth=3,
-                                            learning_rate=0.05, random_state=42)
-        gb_cas.fit(X_ts, y_cas)
-
-        ridge_risk = Ridge(alpha=1.0)
-        ridge_risk.fit(X_ts, y_risk)
-
-        cas_pred_is  = gb_cas.predict(X_ts)
-        risk_pred_is = ridge_risk.predict(X_ts).clip(0, 1)
-
-        mae_cas  = mean_absolute_error(y_cas, cas_pred_is)
-        rmse_cas = np.sqrt(mean_squared_error(y_cas, cas_pred_is))
-        mae_risk = mean_absolute_error(y_risk, risk_pred_is)
-
-        X_fut, months_fut = make_future_feats(ts, n_ahead)
-        cas_fut  = gb_cas.predict(X_fut)
-        risk_fut = ridge_risk.predict(X_fut).clip(0, 1)
-
-        cas_lo = cas_hi = risk_lo = risk_hi = None
-        if conf_int:
-            n_boot = 200
-            rng    = np.random.RandomState(42)
-            cas_boots  = np.zeros((n_boot, n_ahead))
-            risk_boots = np.zeros((n_boot, n_ahead))
-            residuals_cas  = y_cas  - cas_pred_is
-            residuals_risk = y_risk - risk_pred_is
-            for b in range(n_boot):
-                cas_boots[b]  = cas_fut + rng.choice(residuals_cas,  n_ahead, replace=True)
-                risk_boots[b] = np.clip(
-                    risk_fut + rng.choice(residuals_risk, n_ahead, replace=True), 0, 1)
-            cas_lo,  cas_hi  = np.percentile(cas_boots,  [2.5, 97.5], axis=0)
-            risk_lo, risk_hi = np.percentile(risk_boots, [2.5, 97.5], axis=0)
-
-        future_steps = np.arange(ts['t'].max() + 1, ts['t'].max() + 1 + n_ahead)
-        forecast_df  = pd.DataFrame({
-            'Step':              future_steps,
-            'Month':             months_fut,
-            'Forecasted_Cases':  np.round(cas_fut, 1),
-            'Forecasted_Risk_%': np.round(risk_fut * 100, 2),
-            'Risk_Label':        ['🔴 High' if r >= 0.5 else '🟢 Low' for r in risk_fut],
-        })
-
-        # ── Forecast quality metrics ──────────────────────────
-        st.markdown("#### 📋 Forecast Quality (In-Sample Fit)")
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Cases MAE",     f"{mae_cas:.1f}")
-        mc2.metric("Cases RMSE",    f"{rmse_cas:.1f}")
-        mc3.metric("Risk Rate MAE", f"{mae_risk:.4f}")
-
-        hist_t = ts['t'].values
-
-        # ── Plot 1: Cases ─────────────────────────────────────
-        st.markdown("#### 📉 Malaria Cases — Historical + Forecast")
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(hist_t, y_cas, 'o-', color='#3B82F6', lw=2, markersize=5,
-                label='Historical (actual)', zorder=3)
-        ax.plot(hist_t, cas_pred_is, '--', color='#94A3B8', lw=1.5,
-                label='In-sample fit', alpha=0.7)
-        ax.plot(future_steps, cas_fut, 's-', color='#EF4444', lw=2.5, markersize=6,
-                label=f'Forecast (+{n_ahead} months)', zorder=3)
-        if conf_int and cas_lo is not None:
-            ax.fill_between(future_steps, cas_lo, cas_hi,
-                            color='#EF4444', alpha=0.15, label='95% CI')
-        ax.axvline(x=hist_t[-1] + 0.5, color='grey', linestyle=':', lw=1.5, alpha=0.7)
-        ax.set_xlabel('Time Step (months elapsed)', fontsize=11)
-        ax.set_ylabel('Avg Malaria Cases', fontsize=11)
-        ax.set_title('Malaria Cases Trend Forecast', fontweight='bold', fontsize=13)
-        ax.legend(fontsize=10)
-        ax.spines[['top', 'right']].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig); plt.close()
-
-        # ── Plot 2: Risk ──────────────────────────────────────
-        st.markdown("#### 🔴 High-Risk Probability — Historical + Forecast")
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(hist_t, y_risk * 100, 'o-', color='#10B981', lw=2, markersize=5,
-                label='Historical high-risk rate', zorder=3)
-        ax.plot(hist_t, risk_pred_is * 100, '--', color='#94A3B8', lw=1.5,
-                label='In-sample fit', alpha=0.7)
-        ax.plot(future_steps, risk_fut * 100, 's-', color='#F59E0B', lw=2.5, markersize=6,
-                label=f'Forecast (+{n_ahead} months)', zorder=3)
-        if conf_int and risk_lo is not None:
-            ax.fill_between(future_steps, risk_lo * 100, risk_hi * 100,
-                            color='#F59E0B', alpha=0.15, label='95% CI')
-        ax.axhline(50, color='#EF4444', lw=1, linestyle='--', alpha=0.5)
-        ax.text(0.01, 51, 'High-risk threshold (50%)',
-                transform=ax.get_xaxis_transform(), fontsize=8, color='#EF4444')
-        ax.axvline(x=hist_t[-1] + 0.5, color='grey', linestyle=':', lw=1.5, alpha=0.7)
-        ax.set_xlabel('Time Step (months elapsed)', fontsize=11)
-        ax.set_ylabel('High-Risk Rate (%)', fontsize=11)
-        ax.set_ylim(-5, 110)
-        ax.set_title('High-Risk Probability Trend Forecast', fontweight='bold', fontsize=13)
-        ax.legend(fontsize=10)
-        ax.spines[['top', 'right']].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig); plt.close()
-
-        # ── Plot 3: Seasonal pattern ──────────────────────────
-        st.markdown("#### 🌡️ Seasonal Pattern — Average Cases by Calendar Month")
-        month_avg   = ts.groupby('Month')['Malaria_Cases'].mean().reindex(range(1, 13))
-        month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        mean_val = month_avg.mean()
-        fig, ax  = plt.subplots(figsize=(10, 4))
-        bar_colors = ['#EF4444' if (not np.isnan(v) and v >= mean_val) else '#3B82F6'
-                      for v in month_avg.values]
-        bars = ax.bar(range(1, 13), month_avg.fillna(0).values,
-                      color=bar_colors, edgecolor='white', alpha=0.9)
-        ax.axhline(mean_val, color='grey', lw=1.5, linestyle='--', label='Annual average')
-        ax.set_xticks(range(1, 13)); ax.set_xticklabels(month_names, fontsize=10)
-        ax.set_ylabel('Avg Malaria Cases', fontsize=11)
-        ax.set_title('Seasonal Pattern (Calendar Month)', fontweight='bold', fontsize=12)
-        ax.legend(); ax.spines[['top', 'right']].set_visible(False)
-        for bar, val in zip(bars, month_avg.values):
-            if not np.isnan(val):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                        f'{val:.0f}', ha='center', va='bottom', fontsize=8)
-        plt.tight_layout()
-        st.pyplot(fig); plt.close()
-
-        # ── Trend decomposition ───────────────────────────────
-        if show_decomp and len(ts) >= 12:
-            st.markdown("#### 🔬 Trend Decomposition")
-            t_arr  = ts['t'].values.astype(float)
-            y_arr  = ts['Malaria_Cases'].values.astype(float)
-            slope, intercept, r_val, p_val, _ = stats.linregress(t_arr, y_arr)
-            trend_line = slope * t_arr + intercept
-            seasonal   = y_arr - trend_line
-            residual   = y_arr - trend_line - seasonal
-
-            fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
-            axes[0].plot(t_arr, y_arr, color='#3B82F6', lw=2)
-            axes[0].plot(t_arr, trend_line, color='#EF4444', lw=1.5,
-                         linestyle='--', label='Trend')
-            axes[0].set_ylabel('Original'); axes[0].legend()
-            axes[0].set_title('Trend Decomposition — Malaria Cases', fontweight='bold')
-            axes[1].bar(t_arr, seasonal, color='#10B981', alpha=0.7)
-            axes[1].axhline(0, color='grey', lw=0.8); axes[1].set_ylabel('Seasonal')
-            axes[2].plot(t_arr, residual, color='#F59E0B', lw=1.2)
-            axes[2].axhline(0, color='grey', lw=0.8)
-            axes[2].set_ylabel('Residual'); axes[2].set_xlabel('Time Step')
-            for ax in axes: ax.spines[['top', 'right']].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig); plt.close()
-
-            trend_dir = "📈 Upward" if slope > 0 else "📉 Downward"
-            st.info(
-                f"**Linear trend slope:** {slope:+.2f} cases/month  ·  "
-                f"**Direction:** {trend_dir}  ·  **R²:** {r_val**2:.3f}  ·  "
-                f"**p-value:** {p_val:.4f}"
-            )
-
-        # ── Forecast table ────────────────────────────────────
-        st.markdown("#### 📋 Forecast Table")
-        if conf_int and cas_lo is not None:
-            forecast_df['Cases_Lower_95']  = np.round(cas_lo, 1)
-            forecast_df['Cases_Upper_95']  = np.round(cas_hi, 1)
-            forecast_df['Risk_%_Lower_95'] = np.round(risk_lo * 100, 2)
-            forecast_df['Risk_%_Upper_95'] = np.round(risk_hi * 100, 2)
-
-        # pandas ≥ 2.1 uses style.map; older uses style.applymap
-        def _risk_style(v):
-            if v == '🔴 High': return 'background-color: #fee2e2'
-            if v == '🟢 Low':  return 'background-color: #dcfce7'
-            return ''
-
-        try:
-            styled = forecast_df.style.map(_risk_style, subset=['Risk_Label'])
-        except AttributeError:
-            styled = forecast_df.style.applymap(_risk_style, subset=['Risk_Label'])
-
-        st.dataframe(styled, use_container_width=True)
-
-        high_risk_months = int((risk_fut >= 0.5).sum())
-        st.info(
-            f"📊 **Forecast summary:** Over the next **{n_ahead} months**, "
-            f"**{high_risk_months}** months are predicted **high-risk** and "
-            f"**{n_ahead - high_risk_months}** months **low-risk**. "
-            f"Average forecasted cases: **{cas_fut.mean():.1f}** / month."
-        )
-
-        peak_idx        = int(np.argmax(cas_fut))
-        month_names_all = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        peak_month_name = month_names_all[months_fut[peak_idx] - 1]
-        st.warning(
-            f"⚠️ **Highest forecasted burden:** Month **{peak_idx + 1}** of the forecast "
-            f"(calendar month: **{peak_month_name}**) — "
-            f"predicted **{cas_fut[peak_idx]:.0f} cases** "
-            f"with **{risk_fut[peak_idx]*100:.1f}% high-risk probability**."
-        )
-
-
-# ══════════════════════════════════════════════════════════════
-# Section 3 — Custom Training Experiment
-# ══════════════════════════════════════════════════════════════
-st.markdown("---")
-st.subheader("🧪 Custom Training Experiment")
-st.markdown(
-    "Retrain a model on a *filtered copy* of your dataset to test how different "
-    "data slices affect performance. *The original dataset is never modified.*"
-)
-
-with st.expander("⚙️ Configure & Run Custom Experiment", expanded=False):
-
-    st.markdown("##### Step 1 — Filter the dataset copy")
-    ex1, ex2 = st.columns(2)
-    month_range = ex1.slider("Include months", 1, 12, (1, 12), key="exp_month_range")
-
-    rain_min_val = float(X['Rainfall_mm'].min())
-    rain_max_val = float(X['Rainfall_mm'].max())
-    rain_range   = ex2.slider("Rainfall range (mm)", rain_min_val, rain_max_val,
-                               (rain_min_val, rain_max_val), key="exp_rain_range")
-
-    ex3, ex4 = st.columns(2)
-    temp_min_val = float(X['Temperature_C'].min())
-    temp_max_val = float(X['Temperature_C'].max())
-    temp_range   = ex3.slider("Temperature range (°C)", temp_min_val, temp_max_val,
-                               (temp_min_val, temp_max_val), key="exp_temp_range")
-    sample_pct   = ex4.slider("Use what % of filtered rows", 10, 100, 100, key="exp_sample_pct")
-
-    st.markdown("##### Step 2 — Choose a model")
-    exp_model_name = st.selectbox(
-        "Model for this experiment",
-        ["Logistic Regression", "Random Forest", "Gradient Boosting"],
-        key="exp_model_name",
-    )
-    exp_test_size = st.slider("Experiment test split %", 10, 40, 20, key="exp_test_size") / 100
-
-    run_exp = st.button("▶️ Run Custom Experiment", type="primary", key="exp_run_btn")
-
-    if run_exp:
-        X_exp = X.copy()
-        y_exp = y.copy()
-
-        mask = (
-            X_exp['Month'].between(month_range[0], month_range[1]) &
-            X_exp['Rainfall_mm'].between(rain_range[0], rain_range[1]) &
-            X_exp['Temperature_C'].between(temp_range[0], temp_range[1])
-        )
-        X_exp = X_exp[mask]; y_exp = y_exp[mask]
-
-        if sample_pct < 100:
-            sample_n = max(int(len(X_exp) * sample_pct / 100), 10)
-            idx      = np.random.RandomState(42).choice(len(X_exp), sample_n, replace=False)
-            X_exp = X_exp.iloc[idx]; y_exp = y_exp.iloc[idx]
-
-        if len(X_exp) < 20:
-            st.error("⚠️ Not enough rows after filtering (need ≥ 20). Please widen your filters.")
-        elif y_exp.nunique() < 2:
-            st.error("⚠️ Filtered data contains only one class. Please adjust the filters.")
-        else:
-            st.info(
-                f"🔬 Training on **{len(X_exp)} rows** "
-                f"({int((y_exp==0).sum())} low-risk, {int((y_exp==1).sum())} high-risk) — "
-                f"original dataset untouched ({len(X)} rows)."
-            )
-
-            Xtr_e, Xte_e, ytr_e, yte_e = train_test_split(
-                X_exp, y_exp, test_size=exp_test_size, random_state=42, stratify=y_exp
-            )
-            sc_e      = StandardScaler()
-            Xtr_e_sc  = sc_e.fit_transform(Xtr_e)
-            Xte_e_sc  = sc_e.transform(Xte_e)
-
-            try:
-                if exp_model_name == "Logistic Regression":
-                    m_exp = LogisticRegression(max_iter=1000, random_state=42)
-                    m_exp.fit(Xtr_e_sc, ytr_e)
-                    yp_e = m_exp.predict(Xte_e_sc)
-                    ypr_e = m_exp.predict_proba(Xte_e_sc)[:, 1]
-                elif exp_model_name == "Random Forest":
-                    m_exp = RandomForestClassifier(n_estimators=100, random_state=42)
-                    m_exp.fit(Xtr_e, ytr_e)
-                    yp_e = m_exp.predict(Xte_e)
-                    ypr_e = m_exp.predict_proba(Xte_e)[:, 1]
-                else:
-                    m_exp = GradientBoostingClassifier(n_estimators=100, random_state=42)
-                    m_exp.fit(Xtr_e, ytr_e)
-                    yp_e = m_exp.predict(Xte_e)
-                    ypr_e = m_exp.predict_proba(Xte_e)[:, 1]
-
-                try:
-                    exp_auc = round(roc_auc_score(yte_e, ypr_e), 4)
-                except ValueError:
-                    exp_auc = float('nan')
-
-                exp_metrics = {
-                    'Accuracy':  round(accuracy_score(yte_e, yp_e), 4),
-                    'Precision': round(precision_score(yte_e, yp_e, zero_division=0), 4),
-                    'Recall':    round(recall_score(yte_e, yp_e, zero_division=0), 4),
-                    'F1 Score':  round(f1_score(yte_e, yp_e, zero_division=0), 4),
-                    'ROC-AUC':   exp_auc,
-                }
-
-                st.markdown(f"#### 📊 Results — {exp_model_name} (Custom Experiment)")
-                exp_cols = st.columns(5)
-                for col, (metric, val) in zip(exp_cols, exp_metrics.items()):
-                    delta_str = None
-                    if exp_model_name in results and metric in results[exp_model_name]:
-                        base_val  = results[exp_model_name][metric]
-                        if not (np.isnan(val) or np.isnan(base_val)):
-                            delta_str = f"{val - base_val:+.4f} vs full data"
-                    col.metric(metric, f"{val:.4f}" if not np.isnan(val) else "N/A", delta_str)
-
-                if exp_model_name in results:
-                    st.markdown("##### Confusion Matrix Comparison")
-                    cm_cols = st.columns(2)
-                    for idx_cm, (label_cm, cm_data) in enumerate([
-                        (f"{exp_model_name} — Custom ({len(X_exp)} rows)",
-                         confusion_matrix(yte_e, yp_e)),
-                        (f"{exp_model_name} — Full Data ({len(X)} rows)",
-                         results[exp_model_name]['cm']),
-                    ]):
-                        fig, ax = plt.subplots(figsize=(4, 3.5))
-                        im = ax.imshow(cm_data, interpolation='nearest', cmap='Purples')
-                        plt.colorbar(im, ax=ax)
-                        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-                        ax.set_xticklabels(['Low Risk', 'High Risk'], rotation=30, fontsize=9)
-                        ax.set_yticklabels(['Low Risk', 'High Risk'], fontsize=9)
-                        thresh = cm_data.max() / 2
-                        for r in range(2):
-                            for c in range(2):
-                                ax.text(c, r, str(cm_data[r, c]), ha='center', va='center',
-                                        fontsize=13, fontweight='bold',
-                                        color='white' if cm_data[r, c] > thresh else 'black')
-                        ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
-                        ax.set_title(label_cm, fontweight='bold', fontsize=9)
-                        plt.tight_layout()
-                        cm_cols[idx_cm].pyplot(fig); plt.close()
-                else:
-                    st.info("Train the main models first to see a side-by-side comparison.")
-
-            except Exception as err:
-                st.error(f"❌ Experiment failed: {err}")
-
-# ── Footer ─────────────────────────────────────────────────────
-st.markdown("---")
-st.caption("Group 3 | BSc Data Science | Meru University of Science and Technology | 2026")
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "authorship_tag": "ABX9TyN8asvCd1cMjmYfc/jzDM42",
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/Robian-spec/Malaria-Prediction-Model-Using-Machine-Learning/blob/main/Stream_LIt_Malaria_Prediction_using_ML.ipynb\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": 17,
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "gsOB82SbhjQa",
+        "outputId": "5f454f8a-8e2c-404c-e6de-6db537f34069"
+      },
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "✅ All packages installed successfully\n"
+          ]
+        }
+      ],
+      "source": [
+        "# ╔══════════════════════════════════════════════════════════════════╗\n",
+        "# ║                        CELL 1 — INSTALLATION                    ║\n",
+        "# ║  This cell installs all Python libraries needed by the app.     ║\n",
+        "# ║                            ║\n",
+        "# ╚══════════════════════════════════════════════════════════════════╝\n",
+        "\n",
+        "# ── streamlit: the web app framework that builds the browser UI ───\n",
+        "# ── scikit-learn: machine learning library (Random Forest, etc.) ──\n",
+        "# ── joblib: saves/loads trained models to disk so they persist ────\n",
+        "# ── pandas, numpy, matplotlib come pre-installed in Colab already ─\n",
+        "!pip install streamlit scikit-learn joblib -q\n",
+        "\n",
+        "print(\"✅ All packages installed successfully\")\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# ╔══════════════════════════════════════════════════════════════════╗\n",
+        "# ║                  CELL 2 — THE STREAMLIT APP                     ║\n",
+        "# ║  %%writefile writes everything below it into malaria_app.py     ║\n",
+        "# ║  on the Colab disk. It does NOT run the app — Cell 3 does that. ║\n",
+        "# ║   ║\n",
+        "# ╚══════════════════════════════════════════════════════════════════╝\n",
+        "%%writefile malaria_app.py\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 1 — LIBRARY IMPORTS\n",
+        "# Here we bring in every tool the app needs:\n",
+        "#   - streamlit  : builds all the buttons, sliders, charts in browser\n",
+        "#   - pandas     : loads and manipulates the CSV dataset as a table\n",
+        "#   - numpy      : fast number crunching (arrays, math operations)\n",
+        "#   - matplotlib : draws all the charts (bar charts, ROC curves etc.)\n",
+        "#   - joblib     : saves trained models to disk so sliders don't lose them\n",
+        "#   - os         : interacts with the file system (create folders etc.)\n",
+        "#   - warnings   : suppresses noisy non-critical warning messages\n",
+        "#   - sklearn    : the machine learning library — contains:\n",
+        "#       train_test_split        → splits data into training and test sets\n",
+        "#       StandardScaler          → normalises features (mean=0, std=1)\n",
+        "#       LabelEncoder            → converts text categories to numbers\n",
+        "#       LogisticRegression      → Model 1: simple linear classifier\n",
+        "#       RandomForestClassifier  → Model 2: ensemble of decision trees\n",
+        "#       GradientBoostingClassifier → Model 3: boosted tree ensemble\n",
+        "#       SimpleImputer           → fills in missing values with median\n",
+        "#       accuracy_score etc.     → measures how good each model is\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "import streamlit as st\n",
+        "import pandas as pd\n",
+        "import numpy as np\n",
+        "import matplotlib.pyplot as plt\n",
+        "import joblib, os, warnings\n",
+        "warnings.filterwarnings('ignore')\n",
+        "\n",
+        "from sklearn.model_selection import train_test_split\n",
+        "from sklearn.preprocessing import StandardScaler, LabelEncoder\n",
+        "from sklearn.linear_model import LogisticRegression\n",
+        "from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier\n",
+        "from sklearn.impute import SimpleImputer\n",
+        "from sklearn.metrics import (accuracy_score, precision_score, recall_score,\n",
+        "    f1_score, confusion_matrix, roc_auc_score, roc_curve)\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 2 — STREAMLIT PAGE CONFIGURATION\n",
+        "# This is where Streamlit starts. set_page_config() must be the\n",
+        "# very first Streamlit call in the script.\n",
+        "#   - page_title : text shown on the browser tab\n",
+        "#   - page_icon  : emoji shown on the browser tab\n",
+        "#   - layout     : \"wide\" uses the full browser width\n",
+        "# The st.markdown() calls inject raw HTML/CSS to style the table\n",
+        "# and draw the green/teal gradient banner at the top of the page.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.set_page_config(page_title=\"Malaria Prediction | Group 3\", page_icon=\"🦟\", layout=\"wide\")\n",
+        "\n",
+        "# CSS override — forces table text to always be black on white\n",
+        "# (Streamlit's default dark theme can make table text invisible)\n",
+        "st.markdown(\"\"\"\n",
+        "<style>\n",
+        "table {color:#000000 !important; background:#ffffff !important;}\n",
+        "th {background:#1a5276 !important; color:#ffffff !important; padding:10px !important;}\n",
+        "td {color:#000000 !important; background:#ffffff !important; padding:8px !important;}\n",
+        "tr:nth-child(even) td {background:#eaf4fb !important;}\n",
+        "</style>\n",
+        "\"\"\", unsafe_allow_html=True)\n",
+        "\n",
+        "# Hero banner — rendered as raw HTML inside the Streamlit page\n",
+        "st.markdown(\"\"\"\n",
+        "<div style=\"background:linear-gradient(135deg,#1a5276,#117a65);padding:2rem;border-radius:12px;color:white;margin-bottom:1rem\">\n",
+        "<h1>🦟 Malaria Infection Prediction System</h1>\n",
+        "<p>Group 3 · BSc Data Science · Meru University of Science and Technology · 2026<br>\n",
+        "<em>Nyanza · Rift Valley · Central Kenya</em></p>\n",
+        "</div>\n",
+        "\"\"\", unsafe_allow_html=True)\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 3 — GLOBAL CONSTANTS\n",
+        "# Defined once here so they are reused consistently everywhere:\n",
+        "#   FEATURES     : the 12 input columns fed into the ML models\n",
+        "#   METRICS      : the 5 evaluation scores shown in the results table\n",
+        "#   COLORS       : chart colours for the 3 models (blue, green, orange)\n",
+        "#   MN           : month name labels for the selectbox widget\n",
+        "#   MODELS_AVAIL : the 3 model names shown in the sidebar checkbox\n",
+        "#   SAVE_DIR     : folder on Colab disk where trained models are saved\n",
+        "#                  /tmp is used because it persists across Streamlit\n",
+        "#                  reruns within the same Colab session\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "FEATURES = ['Rainfall_mm','Temperature_C','Humidity_percent','Lag_1_Month_Cases',\n",
+        "            'Incidence_per_100k','Month','Population','Malaria_Cases',\n",
+        "            'Cases_Per_Capita','Region_enc','County_enc','Season_enc']\n",
+        "METRICS  = ['Accuracy','Precision','Recall','F1 Score','ROC-AUC']\n",
+        "COLORS   = ['#1a5276','#117a65','#d35400']\n",
+        "MN       = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']\n",
+        "MODELS_AVAILABLE = [\"Logistic Regression\",\"Random Forest\",\"Gradient Boosting\"]\n",
+        "SAVE_DIR = \"/tmp/malaria_models\"\n",
+        "\n",
+        "# Create the save folder if it doesn't already exist\n",
+        "os.makedirs(SAVE_DIR, exist_ok=True)\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 4 — SIDEBAR: FILE UPLOAD\n",
+        "# st.sidebar.* puts widgets in the left panel instead of main page.\n",
+        "# file_uploader() creates a drag-and-drop box that accepts CSV files.\n",
+        "# The user must upload their dataset here before anything else works.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.sidebar.header(\"📂 Dataset\")\n",
+        "uploaded = st.sidebar.file_uploader(\"Upload CSV\", type=[\"csv\"])\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 5 — DATA LOADING\n",
+        "# @st.cache_data tells Streamlit to cache (remember) the result of\n",
+        "# this function. If the same file is uploaded again, it won't\n",
+        "# reload it from disk — it reuses the cached result. This makes\n",
+        "# the app much faster when sliders are moved.\n",
+        "# pd.read_csv() reads the CSV file into a pandas DataFrame (table).\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "@st.cache_data\n",
+        "def load_data(file):\n",
+        "    return pd.read_csv(file)\n",
+        "\n",
+        "# Gate: if no file is uploaded yet, show a hint and stop execution.\n",
+        "# st.stop() halts the script here — nothing below runs until a file\n",
+        "# is uploaded.\n",
+        "if not uploaded:\n",
+        "    st.info(\"⬅️ Upload Final_Malaria_Dataset.csv in the sidebar to begin.\")\n",
+        "    st.stop()\n",
+        "\n",
+        "df_raw = load_data(uploaded)\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 6 — DATA PREPROCESSING (CLEANING & FEATURE ENGINEERING)\n",
+        "# This function transforms the raw CSV into clean model-ready data.\n",
+        "# Also cached so it only runs once per uploaded file.\n",
+        "#\n",
+        "# Steps inside preprocess():\n",
+        "#   1. DROP IRRELEVANT COLUMNS\n",
+        "#      Columns like ID, Notes, Health_Facilities carry no predictive\n",
+        "#      signal for malaria risk, so they are removed.\n",
+        "#\n",
+        "#   2. REMOVE DUPLICATE ROWS\n",
+        "#      drop_duplicates() removes any rows that appear more than once,\n",
+        "#      preventing the model from overfitting to repeated data.\n",
+        "#\n",
+        "#   3. STANDARDISE TEXT COLUMNS\n",
+        "#      .str.strip() removes leading/trailing spaces.\n",
+        "#      .str.title() makes \"NYANZA\" → \"Nyanza\" (consistent casing).\n",
+        "#\n",
+        "#   4. HANDLE MISSING VALUES (IMPUTATION)\n",
+        "#      SimpleImputer fills any NaN cells with the median of that\n",
+        "#      column. Using median (not mean) is more robust to outliers.\n",
+        "#\n",
+        "#   5. REMOVE OUTLIERS (IQR CLIPPING)\n",
+        "#      For each numeric column, values below Q1-1.5*IQR or above\n",
+        "#      Q3+1.5*IQR are clipped to those boundary values. This stops\n",
+        "#      extreme values from distorting the model.\n",
+        "#\n",
+        "#   6. FEATURE ENGINEERING — SEASON\n",
+        "#      A new 'Season' column is derived from the Month number:\n",
+        "#        Mar-May  → Long Rains (peak malaria season)\n",
+        "#        Jun-Aug  → Dry\n",
+        "#        Sep-Nov  → Short Rains\n",
+        "#        Dec-Feb  → Cool Dry\n",
+        "#\n",
+        "#   7. FEATURE ENGINEERING — CASES PER CAPITA\n",
+        "#      Malaria_Cases / Population * 100000 gives a rate that is\n",
+        "#      comparable across counties of different population sizes.\n",
+        "#\n",
+        "#   8. LABEL ENCODING\n",
+        "#      ML models only accept numbers, not text. LabelEncoder\n",
+        "#      converts Region, County, Season to integer codes.\n",
+        "#      e.g. \"Nyanza\" → 1, \"Rift Valley\" → 2\n",
+        "#\n",
+        "#   9. RETURN ONLY THE 12 MODEL FEATURES + TARGET\n",
+        "#      X  = the 12 input features (what the model learns from)\n",
+        "#      y  = High_Risk_Binary (0=Low Risk, 1=High Risk) — what we predict\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "@st.cache_data\n",
+        "def preprocess(df):\n",
+        "    df = df.copy()\n",
+        "\n",
+        "    # Step 1: Drop columns with no predictive value\n",
+        "    for c in ['ID','Health_Facilities','Avg_Income','Disease_Cases','Notes']:\n",
+        "        if c in df.columns:\n",
+        "            df.drop(columns=c, inplace=True)\n",
+        "\n",
+        "    # Step 2: Remove duplicate rows\n",
+        "    df.drop_duplicates(inplace=True)\n",
+        "\n",
+        "    # Step 3: Clean text columns — strip spaces and fix capitalisation\n",
+        "    df['Region'] = df['Region'].str.strip().str.title()\n",
+        "    df['County'] = df['County'].str.strip().str.title()\n",
+        "\n",
+        "    # Step 4: Impute (fill) missing numeric values with column median\n",
+        "    num_cols = df.select_dtypes(include=np.number).columns.tolist()\n",
+        "    df[num_cols] = SimpleImputer(strategy='median').fit_transform(df[num_cols])\n",
+        "\n",
+        "    # Step 5: Clip outliers using the IQR method for key numeric columns\n",
+        "    for col in ['Rainfall_mm','Temperature_C','Humidity_percent',\n",
+        "                'Malaria_Cases','Lag_1_Month_Cases','Incidence_per_100k']:\n",
+        "        if col in df.columns:\n",
+        "            Q1, Q3 = df[col].quantile([0.25, 0.75])\n",
+        "            IQR    = Q3 - Q1\n",
+        "            df[col] = df[col].clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)\n",
+        "\n",
+        "    # Step 6: Create Season feature from Month number\n",
+        "    def season(m):\n",
+        "        return ('Long_Rains'  if m in [3,4,5]   else\n",
+        "                'Dry'         if m in [6,7,8]   else\n",
+        "                'Short_Rains' if m in [9,10,11] else 'Cool_Dry')\n",
+        "    df['Season'] = df['Month'].apply(season)\n",
+        "\n",
+        "    # Step 7: Cases per capita — normalises case counts by population\n",
+        "    df['Cases_Per_Capita'] = df['Malaria_Cases'] / df['Population'] * 100000\n",
+        "\n",
+        "    # Step 8: Encode categorical text columns into integer numbers\n",
+        "    df['Region_enc'] = LabelEncoder().fit_transform(df['Region'])\n",
+        "    df['County_enc'] = LabelEncoder().fit_transform(df['County'])\n",
+        "    df['Season_enc'] = LabelEncoder().fit_transform(df['Season'])\n",
+        "\n",
+        "    # Step 9: Return the 12 features (X) and the binary target (y)\n",
+        "    return df[FEATURES], df['High_Risk_Binary'].astype(int)\n",
+        "\n",
+        "# Run preprocessing on the uploaded data\n",
+        "X, y = preprocess(df_raw)\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 7 — DATASET OVERVIEW METRICS (STREAMLIT DISPLAY)\n",
+        "# st.columns(5) creates 5 equal-width columns side by side.\n",
+        "# .metric() displays a big number card with a label above it.\n",
+        "# These give the user a quick summary of the loaded dataset.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.subheader(\"📊 Dataset Overview\")\n",
+        "c1,c2,c3,c4,c5 = st.columns(5)\n",
+        "c1.metric(\"Records\",        f\"{len(X):,}\")\n",
+        "c2.metric(\"Features\",       len(FEATURES))\n",
+        "c3.metric(\"Low Risk\",       f\"{int((y==0).sum()):,}\")\n",
+        "c4.metric(\"High Risk\",      f\"{int((y==1).sum()):,}\")\n",
+        "c5.metric(\"High-Risk Rate\", f\"{y.mean()*100:.1f}%\")\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 8 — SIDEBAR: MODEL SETTINGS\n",
+        "# These widgets let the user configure training before clicking Train:\n",
+        "#   slider    → choose what % of data to hold out for testing\n",
+        "#               e.g. 20% = 80% trains the model, 20% evaluates it\n",
+        "#   multiselect → choose which of the 3 models to train\n",
+        "#                 defaults to all 3 selected\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.sidebar.header(\"⚙️ Settings\")\n",
+        "test_size  = st.sidebar.slider(\"Test split %\", 10, 40, 20) / 100\n",
+        "models_sel = st.sidebar.multiselect(\"Models\", MODELS_AVAILABLE, default=MODELS_AVAILABLE)\n",
+        "\n",
+        "if not models_sel:\n",
+        "    st.warning(\"Select at least one model.\"); st.stop()\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 9 — MODEL TRAINING\n",
+        "# Triggered when the user clicks \"Train Models\" in the sidebar,\n",
+        "# OR automatically if no saved models exist yet.\n",
+        "#\n",
+        "# Steps:\n",
+        "#   TRAIN/TEST SPLIT\n",
+        "#     train_test_split() divides X and y into:\n",
+        "#       X_tr / y_tr → training set (model learns from this)\n",
+        "#       X_te / y_te → test set    (model is evaluated on this)\n",
+        "#     stratify=y ensures both sets have the same ratio of 0s and 1s.\n",
+        "#     random_state=42 makes the split reproducible every time.\n",
+        "#\n",
+        "#   FEATURE SCALING (StandardScaler)\n",
+        "#     Logistic Regression is sensitive to feature scale, so we\n",
+        "#     normalise: subtract mean, divide by std deviation.\n",
+        "#     This makes all features sit on a similar numeric scale.\n",
+        "#     fit_transform() on training data → learns mean/std from training\n",
+        "#     transform()     on test data     → applies the SAME scaling\n",
+        "#     (IMPORTANT: never fit on test data — that would be data leakage)\n",
+        "#     Random Forest and Gradient Boosting are tree-based — they are\n",
+        "#     NOT sensitive to scale, so raw X_tr/X_te are used for them.\n",
+        "#\n",
+        "#   THE 3 MODELS:\n",
+        "#     Logistic Regression   — linear boundary, fast, interpretable\n",
+        "#     Random Forest         — 200 decision trees voting together\n",
+        "#     Gradient Boosting     — 200 trees each correcting the last one\n",
+        "#\n",
+        "#   EVALUATION METRICS:\n",
+        "#     Accuracy  = (correct predictions) / (total predictions)\n",
+        "#     Precision = of all predicted High-Risk, how many were actually HR?\n",
+        "#     Recall    = of all actual High-Risk, how many did we catch?\n",
+        "#     F1 Score  = harmonic mean of Precision and Recall (best balance)\n",
+        "#     ROC-AUC   = area under ROC curve (1.0 = perfect, 0.5 = random)\n",
+        "#\n",
+        "#   SAVING WITH JOBLIB\n",
+        "#     Each trained model is saved to /tmp/malaria_models/<name>.pkl\n",
+        "#     The scaler is saved too — it must be used again at prediction time.\n",
+        "#     Performance metrics are saved as a dictionary in perf.pkl\n",
+        "#     This is what makes sliders work: models survive Streamlit reruns.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "models_trained = all(\n",
+        "    os.path.exists(f\"{SAVE_DIR}/{n.replace(' ','_')}.pkl\") for n in models_sel\n",
+        ")\n",
+        "\n",
+        "if st.sidebar.button(\"🚀 Train Models\", type=\"primary\") or not models_trained:\n",
+        "    st.subheader(\"🔧 Training Models...\")\n",
+        "\n",
+        "    # ── TRAIN / TEST SPLIT ────────────────────────────────────\n",
+        "    X_tr, X_te, y_tr, y_te = train_test_split(\n",
+        "        X, y, test_size=test_size, random_state=42, stratify=y\n",
+        "    )\n",
+        "\n",
+        "    # ── FEATURE SCALING (for Logistic Regression only) ────────\n",
+        "    sc      = StandardScaler()\n",
+        "    X_tr_sc = sc.fit_transform(X_tr)   # fit on training, then transform\n",
+        "    X_te_sc = sc.transform(X_te)       # only transform test (no fitting)\n",
+        "    joblib.dump(sc, f\"{SAVE_DIR}/scaler.pkl\")  # save scaler to disk\n",
+        "\n",
+        "    perf = {}   # dictionary to store each model's evaluation results\n",
+        "    prog = st.progress(0)  # progress bar widget (0% to 100%)\n",
+        "\n",
+        "    for i, name in enumerate(models_sel):\n",
+        "        st.write(f\"⏳ Training {name}...\")\n",
+        "\n",
+        "        # ── MODEL 1: LOGISTIC REGRESSION ──────────────────────\n",
+        "        # A linear model that estimates probability using a sigmoid\n",
+        "        # function. Uses the SCALED data (X_tr_sc / X_te_sc).\n",
+        "        # max_iter=1000 allows enough iterations to converge.\n",
+        "        if name == \"Logistic Regression\":\n",
+        "            m = LogisticRegression(max_iter=1000, random_state=42)\n",
+        "            m.fit(X_tr_sc, y_tr)\n",
+        "            yp  = m.predict(X_te_sc)        # class predictions (0 or 1)\n",
+        "            ypr = m.predict_proba(X_te_sc)[:,1]  # probability of class 1\n",
+        "\n",
+        "        # ── MODEL 2: RANDOM FOREST ────────────────────────────\n",
+        "        # Builds 200 independent decision trees on random subsets\n",
+        "        # of the data (bagging). Final prediction = majority vote.\n",
+        "        # Uses RAW (unscaled) data — trees don't need scaling.\n",
+        "        elif name == \"Random Forest\":\n",
+        "            m = RandomForestClassifier(n_estimators=200, random_state=42)\n",
+        "            m.fit(X_tr, y_tr)\n",
+        "            yp  = m.predict(X_te)\n",
+        "            ypr = m.predict_proba(X_te)[:,1]\n",
+        "\n",
+        "        # ── MODEL 3: GRADIENT BOOSTING ────────────────────────\n",
+        "        # Builds 200 trees sequentially — each tree corrects the\n",
+        "        # errors of the previous one (boosting). Also uses RAW data.\n",
+        "        else:\n",
+        "            m = GradientBoostingClassifier(n_estimators=200, random_state=42)\n",
+        "            m.fit(X_tr, y_tr)\n",
+        "            yp  = m.predict(X_te)\n",
+        "            ypr = m.predict_proba(X_te)[:,1]\n",
+        "\n",
+        "        # ── CALCULATE EVALUATION METRICS ──────────────────────\n",
+        "        perf[name] = {\n",
+        "            'Accuracy':  round(accuracy_score(y_te, yp),  4),\n",
+        "            'Precision': round(precision_score(y_te, yp, zero_division=0), 4),\n",
+        "            'Recall':    round(recall_score(y_te,    yp, zero_division=0), 4),\n",
+        "            'F1 Score':  round(f1_score(y_te,        yp, zero_division=0), 4),\n",
+        "            'ROC-AUC':   round(roc_auc_score(y_te,  ypr), 4),\n",
+        "            'yp':  yp.tolist(),               # predicted labels (serialisable)\n",
+        "            'ypr': ypr.tolist(),              # predicted probabilities\n",
+        "            'cm':  confusion_matrix(y_te, yp).tolist(),   # 2x2 matrix\n",
+        "            'fi':  m.feature_importances_.tolist()        # RF/GB only\n",
+        "                   if hasattr(m, 'feature_importances_') else None\n",
+        "        }\n",
+        "\n",
+        "        # ── SAVE MODEL TO DISK ────────────────────────────────\n",
+        "        joblib.dump(m, f\"{SAVE_DIR}/{name.replace(' ','_')}.pkl\")\n",
+        "        prog.progress((i+1) / len(models_sel))  # update progress bar\n",
+        "\n",
+        "    # Save performance dict and test labels for later display\n",
+        "    joblib.dump(perf,           f\"{SAVE_DIR}/perf.pkl\")\n",
+        "    joblib.dump(y_te.tolist(),  f\"{SAVE_DIR}/y_te.pkl\")\n",
+        "    st.success(\"✅ All models trained and saved!\")\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 10 — LOAD SAVED RESULTS FROM DISK\n",
+        "# On every Streamlit rerun (e.g. slider moved), we reload the saved\n",
+        "# performance data and test labels from /tmp instead of retraining.\n",
+        "# This is what keeps the app fast and the sliders responsive.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "if not os.path.exists(f\"{SAVE_DIR}/perf.pkl\"):\n",
+        "    st.info(\"👈 Click **Train Models** in the sidebar to begin.\")\n",
+        "    st.stop()\n",
+        "\n",
+        "perf      = joblib.load(f\"{SAVE_DIR}/perf.pkl\")\n",
+        "y_te_list = joblib.load(f\"{SAVE_DIR}/y_te.pkl\")\n",
+        "y_te_arr  = np.array(y_te_list)\n",
+        "\n",
+        "# Only keep models that were actually trained and have saved results\n",
+        "trained = [n for n in models_sel if n in perf]\n",
+        "if not trained:\n",
+        "    st.info(\"👈 Click **Train Models** to train the selected models.\")\n",
+        "    st.stop()\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 11 — PERFORMANCE SUMMARY TABLE (STREAMLIT HTML TABLE)\n",
+        "# Finds the best model by F1 Score (most balanced metric for\n",
+        "# imbalanced datasets like malaria case data).\n",
+        "# Builds an HTML string row by row and renders it with st.markdown().\n",
+        "# The best model's row is highlighted green (#d5f5e3) with ⭐ Best.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.subheader(\"📈 Performance Summary\")\n",
+        "best = max(trained, key=lambda n: perf[n]['F1 Score'])\n",
+        "\n",
+        "rows = \"\"\n",
+        "for idx, name in enumerate(trained):\n",
+        "    ib  = (name == best)\n",
+        "    bg  = '#d5f5e3' if ib else ('#eaf4fb' if idx%2==0 else '#ffffff')\n",
+        "    fw  = 'bold' if ib else 'normal'\n",
+        "    tag = '  ⭐ Best' if ib else ''\n",
+        "    cells = ''.join(\n",
+        "        f'<td style=\"padding:10px;border:1px solid #999;color:#000;text-align:center;\">'\n",
+        "        f'{perf[name][m]:.4f}</td>' for m in METRICS\n",
+        "    )\n",
+        "    rows += (f'<tr style=\"background:{bg};\">'\n",
+        "             f'<td style=\"padding:10px;border:1px solid #999;color:#000;font-weight:{fw};\">'\n",
+        "             f'{name}{tag}</td>{cells}</tr>')\n",
+        "\n",
+        "hdrs = ''.join(\n",
+        "    f'<th style=\"padding:10px;border:1px solid #999;text-align:center;\">{m}</th>'\n",
+        "    for m in METRICS\n",
+        ")\n",
+        "st.markdown(\n",
+        "    f'<table style=\"width:100%;border-collapse:collapse;font-size:15px;\">'\n",
+        "    f'<tr style=\"background:#1a5276;color:#fff;\">'\n",
+        "    f'<th style=\"padding:10px;border:1px solid #999;text-align:left;\">Model</th>'\n",
+        "    f'{hdrs}</tr>{rows}</table>',\n",
+        "    unsafe_allow_html=True\n",
+        ")\n",
+        "st.success(f\"🏆 Best Model: **{best}** — F1 = {perf[best]['F1 Score']:.4f}\")\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 12 — CHARTS (3 TABS)\n",
+        "# st.tabs() creates clickable tab panels — user switches between them.\n",
+        "#\n",
+        "# TAB 1 — GROUPED BAR CHART (Model Metrics Comparison)\n",
+        "#   Plots all 5 metrics side by side for all trained models.\n",
+        "#   Value labels are printed on top of each bar.\n",
+        "#\n",
+        "# TAB 2 — CONFUSION MATRICES\n",
+        "#   A 2x2 grid showing:\n",
+        "#     True Negative  | False Positive\n",
+        "#     False Negative | True Positive\n",
+        "#   Darker blue = more predictions in that cell.\n",
+        "#   White text on dark cells, black text on light cells.\n",
+        "#\n",
+        "# TAB 3 — ROC CURVES\n",
+        "#   Plots True Positive Rate vs False Positive Rate at every threshold.\n",
+        "#   AUC (Area Under Curve) closer to 1.0 = better model.\n",
+        "#   The dashed diagonal = random guessing baseline (AUC = 0.5).\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "t1, t2, t3 = st.tabs([\"📊 Metrics\",\"🟦 Confusion Matrices\",\"📉 ROC Curves\"])\n",
+        "\n",
+        "with t1:\n",
+        "    # Grouped bar chart — one group per metric, one bar per model\n",
+        "    fig, ax = plt.subplots(figsize=(11,5))\n",
+        "    x = np.arange(len(METRICS))\n",
+        "    w = 0.7 / len(trained)   # bar width shrinks as more models added\n",
+        "    for i, name in enumerate(trained):\n",
+        "        vals = [perf[name][m] for m in METRICS]\n",
+        "        bars = ax.bar(\n",
+        "            x + i*w - (len(trained)-1)*w/2, vals, w,\n",
+        "            label=name, color=COLORS[i%3], alpha=0.88, edgecolor='white'\n",
+        "        )\n",
+        "        # Print numeric value on top of each bar\n",
+        "        for bar, v in zip(bars, vals):\n",
+        "            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005,\n",
+        "                    f'{v:.3f}', ha='center', va='bottom', fontsize=8)\n",
+        "    ax.set_xticks(x); ax.set_xticklabels(METRICS); ax.set_ylim(0,1.15)\n",
+        "    ax.set_title('Model Performance Comparison', fontweight='bold')\n",
+        "    ax.legend(); ax.spines[['top','right']].set_visible(False)\n",
+        "    plt.tight_layout(); st.pyplot(fig); plt.close()\n",
+        "\n",
+        "with t2:\n",
+        "    # One confusion matrix per trained model, side by side\n",
+        "    cols = st.columns(len(trained))\n",
+        "    for i, name in enumerate(trained):\n",
+        "        cm = np.array(perf[name]['cm'])\n",
+        "        fig, ax = plt.subplots(figsize=(4,3.5))\n",
+        "        im = ax.imshow(cm, cmap='Blues'); plt.colorbar(im, ax=ax)\n",
+        "        ax.set_xticks([0,1]); ax.set_yticks([0,1])\n",
+        "        ax.set_xticklabels(['Low','High'], rotation=30)\n",
+        "        ax.set_yticklabels(['Low','High'])\n",
+        "        thresh = cm.max() / 2\n",
+        "        for r in range(2):\n",
+        "            for c in range(2):\n",
+        "                # White text on dark blue cells, black text on light cells\n",
+        "                ax.text(c, r, str(cm[r,c]), ha='center', va='center',\n",
+        "                        fontsize=14, fontweight='bold',\n",
+        "                        color='white' if cm[r,c] > thresh else 'black')\n",
+        "        ax.set_title(name, fontweight='bold')\n",
+        "        plt.tight_layout(); cols[i].pyplot(fig); plt.close()\n",
+        "\n",
+        "with t3:\n",
+        "    # ROC curve for each model on the same axes\n",
+        "    fig, ax = plt.subplots(figsize=(8,6))\n",
+        "    for i, name in enumerate(trained):\n",
+        "        fpr, tpr, _ = roc_curve(y_te_arr, np.array(perf[name]['ypr']))\n",
+        "        ax.plot(fpr, tpr, lw=2.5, color=COLORS[i%3],\n",
+        "                label=f'{name} (AUC={perf[name][\"ROC-AUC\"]:.3f})')\n",
+        "    ax.plot([0,1],[0,1],'k--',lw=1,alpha=0.5,label='Random baseline')\n",
+        "    ax.set_xlabel('False Positive Rate'); ax.set_ylabel('True Positive Rate')\n",
+        "    ax.set_title('ROC Curves', fontweight='bold'); ax.legend()\n",
+        "    ax.spines[['top','right']].set_visible(False)\n",
+        "    plt.tight_layout(); st.pyplot(fig); plt.close()\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 13 — FEATURE IMPORTANCE (RANDOM FOREST ONLY)\n",
+        "# Random Forest tracks how much each feature reduces impurity\n",
+        "# across all 200 trees. Higher bar = more important feature.\n",
+        "# Only available for tree-based models (not Logistic Regression).\n",
+        "# Top 25% most important features highlighted in red.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "if \"Random Forest\" in trained and perf[\"Random Forest\"]['fi']:\n",
+        "    st.subheader(\"🌲 Feature Importance (Random Forest)\")\n",
+        "    fi = pd.Series(perf['Random Forest']['fi'], index=FEATURES).sort_values()\n",
+        "    fig, ax = plt.subplots(figsize=(9,5))\n",
+        "    ax.barh(fi.index, fi.values,\n",
+        "            color=['#c0392b' if v >= fi.quantile(0.75) else '#1a5276'\n",
+        "                   for v in fi.values],\n",
+        "            alpha=0.88, edgecolor='white')\n",
+        "    ax.set_title('Feature Importance — top features shown in red',\n",
+        "                 fontweight='bold')\n",
+        "    ax.spines[['top','right']].set_visible(False)\n",
+        "    plt.tight_layout(); st.pyplot(fig); plt.close()\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 14 — LIVE PREDICTION PANEL\n",
+        "# This section is the KEY FIX for the slider problem.\n",
+        "#\n",
+        "# WHY SLIDERS USED TO BE BROKEN:\n",
+        "#   Every time a slider is moved, Streamlit reruns the ENTIRE script\n",
+        "#   from top to bottom. Previously, the trained models only lived in\n",
+        "#   the variable `res` in memory — so they were wiped on every rerun.\n",
+        "#   The prediction section would silently fail or use stale values.\n",
+        "#\n",
+        "# HOW IT IS FIXED NOW:\n",
+        "#   Models are loaded fresh from /tmp/malaria_models/ on every rerun.\n",
+        "#   There is NO predict button — the prediction runs automatically\n",
+        "#   every time any slider changes. Results update instantly.\n",
+        "#\n",
+        "# HELPER FUNCTION — enc_season():\n",
+        "#   Converts the numeric month into a season integer code, matching\n",
+        "#   the same encoding used during preprocessing/training.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.markdown(\"---\")\n",
+        "st.subheader(\"🔮 Live Prediction Panel\")\n",
+        "st.markdown(\"🎛️ **Adjust any slider below — predictions update automatically in real time.**\")\n",
+        "\n",
+        "def enc_season(m):\n",
+        "    \"\"\"Convert month number → (season integer code, season name string)\"\"\"\n",
+        "    s = ('Long_Rains'  if m in [3,4,5]   else\n",
+        "         'Dry'         if m in [6,7,8]   else\n",
+        "         'Short_Rains' if m in [9,10,11] else 'Cool_Dry')\n",
+        "    return {'Cool_Dry':0,'Dry':1,'Long_Rains':2,'Short_Rains':3}[s], s\n",
+        "\n",
+        "\n",
+        "# ── INPUT WIDGETS ─────────────────────────────────────────────\n",
+        "# Each slider has a unique key= argument. This is REQUIRED —\n",
+        "# Streamlit uses keys to track which widget changed and to\n",
+        "# store values across reruns without resetting to defaults.\n",
+        "# ─────────────────────────────────────────────────────────────\n",
+        "st.markdown(\"#### 🌦️ Climate Conditions\")\n",
+        "p1, p2, p3 = st.columns(3)\n",
+        "rainfall    = p1.slider(\"🌧️ Rainfall (mm)\",     0.0, 350.0, 150.0, 5.0,  key=\"rf\")\n",
+        "temperature = p2.slider(\"🌡️ Temperature (°C)\", 10.0,  40.0,  24.0, 0.5,  key=\"tmp\")\n",
+        "humidity    = p3.slider(\"💧 Humidity (%)\",       0.0, 100.0,  70.0, 1.0,  key=\"hum\")\n",
+        "\n",
+        "st.markdown(\"#### 🦟 Epidemiological Inputs\")\n",
+        "p4, p5, p6 = st.columns(3)\n",
+        "lag_cases   = p4.slider(\"📅 Lag 1 Month Cases\",  0.0, 3500.0, 1200.0, 50.0, key=\"lag\")\n",
+        "incidence   = p5.slider(\"📊 Incidence per 100k\", 0.0,  600.0,  120.0,  5.0, key=\"inc\")\n",
+        "month       = p6.selectbox(\"📆 Month\", list(range(1,13)),\n",
+        "                            format_func=lambda m:MN[m-1], index=5, key=\"mon\")\n",
+        "\n",
+        "st.markdown(\"#### 👥 Population\")\n",
+        "p7, p8 = st.columns(2)\n",
+        "population  = p7.slider(\"🏘️ Population\",    100000, 3000000, 500000, 10000, key=\"pop\")\n",
+        "mal_cases   = p8.slider(\"🦟 Malaria Cases\",    0.0,  3500.0, 1200.0,  50.0, key=\"mc\")\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 15 — LIVE PREDICTION COMPUTATION\n",
+        "# Runs on every slider change (no button needed).\n",
+        "#\n",
+        "#   1. Derive season code and cases-per-capita from slider values\n",
+        "#   2. Build a single-row DataFrame matching the 12 training features\n",
+        "#   3. Load the scaler from disk → apply only to Logistic Regression\n",
+        "#      (tree models don't need scaling)\n",
+        "#   4. Load each saved model from disk → predict class + probability\n",
+        "#   5. Display coloured risk cards for each model\n",
+        "#   6. Plot the live probability bar chart\n",
+        "#   7. Plot the ensemble gauge bar (average probability of all models)\n",
+        "#   8. Show a 4-metric input summary with High/Normal labels\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "\n",
+        "# Step 1: Derive engineered features from current slider values\n",
+        "se, sn = enc_season(month)\n",
+        "cpc    = mal_cases / max(population, 1) * 100000   # cases per capita\n",
+        "\n",
+        "# Step 2: Build one-row input DataFrame aligned to training features\n",
+        "inp = pd.DataFrame(\n",
+        "    [[rainfall, temperature, humidity, lag_cases, incidence,\n",
+        "      month, population, mal_cases, cpc, 0, 0, se]],\n",
+        "    columns=FEATURES\n",
+        ")\n",
+        "\n",
+        "# Step 3: Load the scaler that was fitted during training\n",
+        "sc_loaded = joblib.load(f\"{SAVE_DIR}/scaler.pkl\")\n",
+        "\n",
+        "st.markdown(\"---\")\n",
+        "st.markdown(\"### 🎯 Live Prediction Results\")\n",
+        "st.caption(f\"📍 Season: **{sn.replace('_',' ')}**  |  Cases per capita: **{cpc:.1f}** per 100k\")\n",
+        "\n",
+        "# Step 4 & 5: Load each model → predict → display risk card\n",
+        "probs = []\n",
+        "rcols = st.columns(len(trained))\n",
+        "for i, name in enumerate(trained):\n",
+        "    # Load model from disk (survives every Streamlit rerun)\n",
+        "    m    = joblib.load(f\"{SAVE_DIR}/{name.replace(' ','_')}.pkl\")\n",
+        "    # Scale only for Logistic Regression\n",
+        "    X_in = sc_loaded.transform(inp) if name == \"Logistic Regression\" else inp\n",
+        "    pred = m.predict(X_in)[0]            # 0 = Low Risk, 1 = High Risk\n",
+        "    prob = m.predict_proba(X_in)[0][1]   # probability of being High Risk\n",
+        "    probs.append(prob)\n",
+        "    bg  = '#c0392b' if pred == 1 else '#117a65'   # red or green card\n",
+        "    lbl = \"🔴 HIGH RISK\" if pred == 1 else \"🟢 LOW RISK\"\n",
+        "    rcols[i].markdown(f\"\"\"\n",
+        "    <div style=\"background:{bg};padding:1.4rem;border-radius:12px;\n",
+        "                text-align:center;color:white;margin:4px;\n",
+        "                box-shadow:0 2px 8px rgba(0,0,0,0.2);\">\n",
+        "        <div style=\"font-size:0.85rem;opacity:0.85;margin-bottom:4px;\">{name}</div>\n",
+        "        <div style=\"font-size:1.6rem;font-weight:bold;margin:0.3rem 0;\">{lbl}</div>\n",
+        "        <div style=\"font-size:1.1rem;\">Confidence: <b>{prob*100:.1f}%</b></div>\n",
+        "    </div>\"\"\", unsafe_allow_html=True)\n",
+        "\n",
+        "# Ensemble average — mean probability across all selected models\n",
+        "avg = np.mean(probs)\n",
+        "\n",
+        "# Step 6: Live probability bar chart — one bar per model\n",
+        "fig, ax = plt.subplots(figsize=(8,4))\n",
+        "bar_colors = ['#c0392b' if p >= 0.5 else '#117a65' for p in probs]\n",
+        "bars = ax.bar(trained, [p*100 for p in probs],\n",
+        "              color=bar_colors, edgecolor='white', alpha=0.9, width=0.45)\n",
+        "ax.axhline(50, color='grey', lw=1.5, linestyle='--', alpha=0.7,\n",
+        "           label='50% Risk Threshold')\n",
+        "for bar, p in zip(bars, probs):\n",
+        "    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+1.5,\n",
+        "            f'{p*100:.1f}%', ha='center', va='bottom',\n",
+        "            fontsize=13, fontweight='bold',\n",
+        "            color='#c0392b' if p >= 0.5 else '#117a65')\n",
+        "ax.set_ylim(0,120)\n",
+        "ax.set_ylabel('High-Risk Probability (%)', fontsize=11)\n",
+        "ax.set_title(f'Live Risk Probability  |  Ensemble Average: {avg*100:.1f}%',\n",
+        "             fontweight='bold', fontsize=12)\n",
+        "ax.legend(fontsize=10); ax.spines[['top','right']].set_visible(False)\n",
+        "plt.tight_layout(); st.pyplot(fig); plt.close()\n",
+        "\n",
+        "# Step 7: Gauge bar — shows ensemble average as a horizontal bar\n",
+        "risk_label = \"🔴 HIGH RISK\" if avg >= 0.5 else \"🟢 LOW RISK\"\n",
+        "gauge_col  = '#c0392b'      if avg >= 0.5 else '#117a65'\n",
+        "fig, ax = plt.subplots(figsize=(10,1.5))\n",
+        "ax.barh([0],[1], color='#ecf0f1', height=0.6)            # full grey background\n",
+        "ax.barh([0],[avg], color=gauge_col, height=0.6, alpha=0.9) # coloured fill\n",
+        "ax.axvline(0.5, color='#555', lw=2.5, linestyle='--')    # threshold line\n",
+        "ax.set_xlim(0,1); ax.set_yticks([])\n",
+        "ax.set_xticks([0,0.25,0.5,0.75,1.0])\n",
+        "ax.set_xticklabels(['0%','25%','50% threshold','75%','100%'], fontsize=10)\n",
+        "ax.set_title(f'Ensemble Risk Score: {avg*100:.1f}%   →   {risk_label}',\n",
+        "             fontweight='bold', fontsize=13, color=gauge_col)\n",
+        "ax.spines[['top','right','left']].set_visible(False)\n",
+        "plt.tight_layout(); st.pyplot(fig); plt.close()\n",
+        "\n",
+        "# Step 8: Input summary metric cards with High/Normal indicator\n",
+        "st.markdown(\"#### 📋 Input Summary\")\n",
+        "s1, s2, s3, s4 = st.columns(4)\n",
+        "s1.metric(\"🌧️ Rainfall\",    f\"{rainfall:.0f} mm\",   delta=\"High ⚠️\"   if rainfall    > 200  else \"Normal ✅\")\n",
+        "s2.metric(\"🌡️ Temperature\", f\"{temperature:.1f}°C\", delta=\"High ⚠️\"   if temperature > 30   else \"Normal ✅\")\n",
+        "s3.metric(\"💧 Humidity\",    f\"{humidity:.0f}%\",      delta=\"High ⚠️\"   if humidity    > 80   else \"Normal ✅\")\n",
+        "s4.metric(\"🦟 Lag Cases\",   f\"{lag_cases:.0f}\",      delta=\"High ⚠️\"   if lag_cases   > 1500 else \"Normal ✅\")\n",
+        "\n",
+        "\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "# SECTION 16 — FOOTER\n",
+        "# st.caption() renders small grey text — used for attribution.\n",
+        "# ══════════════════════════════════════════════════════════════════\n",
+        "st.markdown(\"---\")\n",
+        "st.caption(\"Group 3 | BSc Data Science | Meru University of Science and Technology | 2026\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "yvsW2E2Qht3O",
+        "outputId": "4379a56e-4c84-4e62-96ea-da49f21018fb"
+      },
+      "execution_count": 18,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "Overwriting malaria_app.py\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# ╔══════════════════════════════════════════════════════════════════╗\n",
+        "# ║              CELL 3 — LAUNCH STREAMLIT + TUNNEL                 ║\n",
+        "# ║  This cell starts the Streamlit web server as a background      ║\n",
+        "# ║  process, then opens a public SSH tunnel so anyone can          ║\n",
+        "# ║  access the app from a browser link.                            ║\n",
+        "# ║          ║\n",
+        "# ╚══════════════════════════════════════════════════════════════════╝\n",
+        "\n",
+        "\n",
+        "import subprocess, time, socket, re, os, fcntl\n",
+        "\n",
+        "PORT = 8501\n",
+        "\n",
+        "# ── STEP 1: Kill any previous Streamlit process ───────────────────\n",
+        "print(\"🛑 Stopping any old Streamlit...\")\n",
+        "subprocess.run([\"pkill\", \"-f\", \"streamlit\"], capture_output=True)\n",
+        "time.sleep(3)   # wait for port to be fully released\n",
+        "\n",
+        "# ── STEP 2: Start Streamlit as a background subprocess ───────────\n",
+        "print(\"🚀 Starting Streamlit...\")\n",
+        "subprocess.Popen(\n",
+        "    [\"streamlit\", \"run\", \"malaria_app.py\",\n",
+        "     \"--server.port\",                 str(PORT),\n",
+        "     \"--server.headless\",             \"true\",\n",
+        "     \"--browser.gatherUsageStats\",    \"false\",\n",
+        "     \"--server.enableCORS\",           \"false\",\n",
+        "     \"--server.enableXsrfProtection\", \"false\"],\n",
+        "    stdout=open(\"st.log\",     \"w\"),\n",
+        "    stderr=open(\"st_err.log\", \"w\")\n",
+        ")\n",
+        "\n",
+        "# ── STEP 3: Wait until Streamlit port is actually open ────────────\n",
+        "# Instead of a fixed sleep, we poll every 2 seconds for up to 60s.\n",
+        "# This way the tunnel only opens AFTER Streamlit is truly ready.\n",
+        "def port_open(p):\n",
+        "    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:\n",
+        "        return s.connect_ex((\"localhost\", p)) == 0\n",
+        "\n",
+        "print(f\"⏳ Waiting for Streamlit on port {PORT}...\", end=\"\")\n",
+        "for i in range(30):          # try for up to 60 seconds (30 x 2s)\n",
+        "    if port_open(PORT):\n",
+        "        print(f\" ready after {(i+1)*2}s ✅\")\n",
+        "        break\n",
+        "    print(\".\", end=\"\", flush=True)\n",
+        "    time.sleep(2)\n",
+        "else:\n",
+        "    print(\"\\n❌ Streamlit did not start. Error log:\")\n",
+        "    print(open(\"st_err.log\").read())\n",
+        "    raise SystemExit(\"Fix the error above, then re-run this cell.\")\n",
+        "\n",
+        "# Extra buffer — give Streamlit 5 more seconds to finish loading\n",
+        "# all its internal components before accepting tunnel traffic\n",
+        "time.sleep(5)\n",
+        "\n",
+        "# ── STEP 4: Open SSH tunnel via localhost.run ─────────────────────\n",
+        "# Kill any old tunnel first\n",
+        "subprocess.run([\"pkill\", \"-f\", \"localhost.run\"], capture_output=True)\n",
+        "subprocess.run([\"pkill\", \"-f\", \"serveo.net\"],    capture_output=True)\n",
+        "time.sleep(2)\n",
+        "\n",
+        "print(\"🌐 Opening public tunnel...\")\n",
+        "tunnel = subprocess.Popen(\n",
+        "    [\"ssh\",\n",
+        "     \"-o\", \"StrictHostKeyChecking=no\",\n",
+        "     \"-o\", \"ServerAliveInterval=60\",   # keep-alive pings every 60s\n",
+        "     \"-o\", \"ServerAliveCountMax=10\",   # allow 10 missed pings\n",
+        "     \"-R\", f\"80:localhost:{PORT}\",\n",
+        "     \"nokey@localhost.run\"],\n",
+        "    stdout=subprocess.PIPE,\n",
+        "    stderr=subprocess.STDOUT\n",
+        ")\n",
+        "\n",
+        "# Make pipe non-blocking so we can read without hanging\n",
+        "fcntl.fcntl(tunnel.stdout, fcntl.F_SETFL, os.O_NONBLOCK)\n",
+        "\n",
+        "# Poll for the URL — check every 2 seconds for up to 40 seconds\n",
+        "output = \"\"\n",
+        "link_found = False\n",
+        "for attempt in range(20):\n",
+        "    time.sleep(2)\n",
+        "    try:\n",
+        "        chunk = tunnel.stdout.read(8192)\n",
+        "        if chunk:\n",
+        "            output += chunk.decode(\"utf-8\", errors=\"ignore\")\n",
+        "    except:\n",
+        "        pass\n",
+        "\n",
+        "    urls = re.findall(r'https://[a-zA-Z0-9\\-]+\\.lhr\\.life', output)\n",
+        "    if urls:\n",
+        "        link_found = True\n",
+        "        print(f\"\\n{'='*58}\")\n",
+        "        print(f\"  🚀  YOUR LIVE LINK  →  {urls[0]}\")\n",
+        "        print(f\"{'='*58}\")\n",
+        "        print(\"  Steps:\")\n",
+        "        print(\"  1️⃣  Open the link above in your browser\")\n",
+        "        print(\"  2️⃣  Upload your CSV in the LEFT sidebar\")\n",
+        "        print(\"  3️⃣  Click 🚀 Train Models\")\n",
+        "        print(\"  4️⃣  Move sliders — predictions update live!\")\n",
+        "        print(f\"\\n  ⚠️  Keep this Colab tab open while using the app.\")\n",
+        "        break\n",
+        "\n",
+        "if not link_found:\n",
+        "    # ── FALLBACK: serveo.net ──────────────────────────────────────\n",
+        "    print(\"localhost.run slow — trying serveo.net...\")\n",
+        "    tunnel.kill()\n",
+        "    time.sleep(2)\n",
+        "\n",
+        "    tunnel2 = subprocess.Popen(\n",
+        "        [\"ssh\",\n",
+        "         \"-o\", \"StrictHostKeyChecking=no\",\n",
+        "         \"-o\", \"ServerAliveInterval=60\",\n",
+        "         \"-R\", f\"80:localhost:{PORT}\",\n",
+        "         \"serveo.net\"],\n",
+        "        stdout=subprocess.PIPE,\n",
+        "        stderr=subprocess.STDOUT\n",
+        "    )\n",
+        "    fcntl.fcntl(tunnel2.stdout, fcntl.F_SETFL, os.O_NONBLOCK)\n",
+        "\n",
+        "    output2 = \"\"\n",
+        "    for attempt in range(20):\n",
+        "        time.sleep(2)\n",
+        "        try:\n",
+        "            chunk = tunnel2.stdout.read(8192)\n",
+        "            if chunk:\n",
+        "                output2 += chunk.decode(\"utf-8\", errors=\"ignore\")\n",
+        "        except:\n",
+        "            pass\n",
+        "\n",
+        "        urls2 = re.findall(r'https?://[a-zA-Z0-9\\-]+\\.serveo\\.net', output2)\n",
+        "        if urls2:\n",
+        "            print(f\"\\n{'='*58}\")\n",
+        "            print(f\"  🚀  YOUR LIVE LINK  →  {urls2[0]}\")\n",
+        "            print(f\"{'='*58}\")\n",
+        "            print(\"  1️⃣  Open the link in your browser\")\n",
+        "            print(\"  2️⃣  Upload CSV → Train Models → move sliders!\")\n",
+        "            break\n",
+        "    else:\n",
+        "        print(\"\\n❌ Both tunnel services failed.\")\n",
+        "        print(\"👉 Try this manual fix in Colab:\")\n",
+        "        print(\"   Runtime menu → Ports → Add port 8501\")\n",
+        "        print(\"\\n── Streamlit log (for debugging) ──\")\n",
+        "        print(open(\"st_err.log\").read())\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "4gFx6Y89iEDI",
+        "outputId": "20d3137b-165e-47b3-b411-40bcabf492ab"
+      },
+      "execution_count": 19,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "🛑 Stopping any old Streamlit...\n",
+            "🚀 Starting Streamlit...\n",
+            "⏳ Waiting for Streamlit on port 8501..... ready after 6s ✅\n",
+            "🌐 Opening public tunnel...\n",
+            "\n",
+            "==========================================================\n",
+            "  🚀  YOUR LIVE LINK  →  https://290c13499ff705.lhr.life\n",
+            "==========================================================\n",
+            "  Steps:\n",
+            "  1️⃣  Open the link above in your browser\n",
+            "  2️⃣  Upload your CSV in the LEFT sidebar\n",
+            "  3️⃣  Click 🚀 Train Models\n",
+            "  4️⃣  Move sliders — predictions update live!\n",
+            "\n",
+            "  ⚠️  Keep this Colab tab open while using the app.\n"
+          ]
+        }
+      ]
+    }
+  ]
+}
